@@ -20,9 +20,12 @@
 9. [数据路径对照](#9-数据路径对照)
 10. [与 `ibv_post_send` / 训练性能的关系](#10-与-ibv_post_send--训练性能的关系)
 11. [如何用日志验证是否生效](#11-如何用日志验证是否生效)
-12. [推荐配置与排查清单](#12-推荐配置与排查清单)
-13. [结论](#13-结论)
-14. [修订记录](#14-修订记录)
+12. [**节点间 CollNet：原理、机制与实现流程**](#12-节点间-collnet原理机制与实现流程)
+13. [**节点内 NVLS AllReduce：原理、机制与实现流程**](#13-节点内-nvls-allreduce原理机制与实现流程)
+14. [推荐配置与排查清单](#14-推荐配置与排查清单)
+15. [结论](#15-结论)
+16. [修订记录](#16-修订记录)
+17. [附录](#附录-a关键源码索引)
 
 ---
 
@@ -523,9 +526,415 @@ export NCCL_IB_HCA=mlx5_0,mlx5_1,mlx5_2,mlx5_5,mlx5_6,mlx5_7,mlx5_8,mlx5_9
 
 ---
 
-## 12. 推荐配置与排查清单
+## 12. 节点间 CollNet：原理、机制与实现流程
 
-### 12.1 本机推荐
+> 代码主线：`src/transport/coll_net.cc`、`src/graph/connect.cc`、`src/device/all_reduce.h`（COLLNET_*）、`src/plugin/net/*`（插件适配）、`src/init.cc`（setup 挂接）。
+
+### 12.1 原理：为什么需要 CollNet
+
+普通多机 AllReduce（Ring / Tree + **NET**）把集合通信拆成大量 **点对点 RDMA**：
+
+```text
+每个 ring 边 / tree 边:
+  GPU → (可选 bounce) → NIC ibv_post_send → 网络 → 对端 NIC → GPU
+  主机 proxy 为每条边做 progress
+```
+
+当节点数、channel、消息规模上升时：
+
+- 边数与 `post_send` 次数爆炸  
+- 交换机只做转发，**不参与 reduce**  
+- 带宽受「多跳点对点」与 host 进度线程限制  
+
+**CollNet（Collective Network）** 的目标是：把 **跨节点的集合语义**（至少 AllReduce，以及 AllGather / ReduceScatter 等）交给 **专用插件 + 常配合智能交换机（如 IB SHARP）** 完成一次 offload 规约，而不是在主机上拼很多 P2P 边。
+
+```text
+逻辑对比:
+
+  NET 模式:   多 rank × 多边 × 多次 RDMA Write/WithImm
+  CollNet:    节点 head 参与 collNetComm → 插件 iallreduce(…)
+              （交换机/网卡侧完成跨节点 reduce+broadcast 语义）
+```
+
+**注意：** CollNet **不是** `net_ib` 的别名。`TRANSPORT_COLLNET` 有独立 vtable；数据面核心是插件的 `iallreduce` / `iallgather` / `ireducescatter`，不是 `ncclIbIsend`。
+
+### 12.2 角色与拓扑抽象
+
+#### 12.2.1 Head（轨 / rail）
+
+每个节点选出若干 **head rank**（与 channel / NVLS heads 对齐）：
+
+- **有 NVLS 时**（`ncclCollNetSetup`）：head 直接复用 `comm->nvlsHeads`（与 NVLS 多播 heads 一致）。  
+- **无 NVLS 时**：从 `COLLNET_DIRECT` graph 的 `intra[c*localRanks+0]` 收集 unique heads。
+
+Head 是 **本节点对接 CollNet 网络的“出口/入口 GPU”**：
+
+- 机内：其它 GPU 把数据 reduce/scatter 到 head（P2P / NVLS / chain）  
+- 机间：head 的 **proxy 线程** 调 `ncclCollNet->iallreduce` 等  
+
+#### 12.2.2 两种算法形态
+
+| 算法 | 机内结构 | 机间 | 适用 |
+|------|----------|------|------|
+| **COLLNET_CHAIN** | 节点内链（类似 tree/chain，`collnetChain.up/down`） | 链上特定 rank 接 CollNet | 更通用；需 chain heads 是 CollNet heads 的子集 |
+| **COLLNET_DIRECT** | 叶子 ↔ 多个 heads（`collnetDirect.up/down/heads`） | 每个 head 一条 CollNet 轨 | 要求 **NVSwitch**（`nvsCount>0`）；`maxLocalRanks ≤ NCCL_MAX_DIRECT_ARITY+1` |
+
+`connectCollNet`（`src/graph/connect.cc`）为 DIRECT 设置：
+
+- `headRank`：本 rank 是否为第 i 个 head  
+- `out = nRanks`：伪 peer，表示 **CollNet 网络侧**（kernel 里 `direct->out`）  
+- `down[]`：head 连接的同节点 peer  
+- `up[]` / `heads[]`：叶子连向的 heads  
+- `shift`：错开头发送时刻，减轻 head 热点  
+
+### 12.3 初始化与建连流程
+
+```text
+[1] 插件加载
+    ncclCollNet != nullptr  (collNetSupport)
+
+[2] env / config
+    NCCL_COLLNET_ENABLE=1
+    nNodes >= NCCL_COLLNET_NODE_THRESHOLD (默认 2)
+
+[3] 图搜索 (init.cc)
+    ncclTopoCompute(COLLNET_CHAIN)   pattern TREE, collNet=1
+    ncclTopoCompute(COLLNET_DIRECT)  pattern COLLNET_DIRECT
+    graph 需 net 设备 collSupport
+
+[4] 拓扑后处理 (connect.cc)
+    可能增加 channel 以吃满机内带宽
+    connectCollNet() 填 collnetDirect 字段
+    chain depth = nRanks/nNodes
+
+[5] ncclCollNetSetup (coll_net.cc)
+    确定 collNetHeads / collNetHeadsNum
+    collNetChainSupport = heads 是否匹配 chain
+    分配 collNetSharedRes (nChannels, buffSize)
+    collNetInitRailRankMap
+    对每个 channel × 每个 head:
+      ncclTransportCollNetSetup(..., collNetRecv)
+      ncclTransportCollNetSetup(..., collNetSend)
+    首 channel 后 AllGather 校验，失败则整 comm 关 CollNet
+
+[6] Buffer setup
+    ncclCollNetChainBufferSetup
+    ncclCollNetDirectBufferSetup (localRanks 足够小时)
+```
+
+#### 12.3.1 传输 setup（`sendSetup` / `recvSetup`）
+
+每个 head 上的 connector：
+
+1. `ncclTopoGetNetDev` 选 CollNet 网卡 / rail  
+2. `ncclTopoCheckGdr` 决定是否 GDR  
+3. `ncclProxyConnect(TRANSPORT_COLLNET, …)` 把 **proxy 绑到本 rank**  
+4. `ncclProxyCallBlocking(..., ncclProxyMsgSetup, …)`：  
+   - **Recv 侧** 得到 `collNetHandle`（供 connect 交换）  
+   - **Send 侧** 完成发送资源准备  
+
+日志示例：
+
+```text
+CollNet 00/0 : <rank> [send] via COLLNET/<plugin>/<dev>/GDRDMA
+CollNet 00/0 : <rank> [receive] via COLLNET/<plugin>/<dev>
+```
+
+Proxy 侧资源（`sendResources` / `recvResources`）包括：
+
+- `collNetComm`：插件集合通信句柄  
+- `connectMap`：host/dev/shared 缓冲布局  
+- `sendMem` / `recvMem`：与 GPU 的 head/tail、`connFifo` 握手  
+- protocol 缓冲 mhandle、可选 GDR sync/flush  
+- `reqFifo`：collnet 请求槽，控制 send/recv 轮次  
+
+### 12.4 运行时数据面流程（以 AllReduce 为例）
+
+#### 12.4.1 端到端分层
+
+```text
+应用: ncclAllReduce
+  → enqueue 选中 COLLNET_DIRECT 或 COLLNET_CHAIN
+  → 启动 device kernel (GPU)
+  → 同时 proxy 线程 progress TRANSPORT_COLLNET
+
+机内 (GPU kernel):
+  非 head: scatter/reduce 到 head(s)  [P2P / NVLS / chain]
+  head:    把本轨规约结果交给 collnet peer (out)
+           再从 collnet 收回结果并 bcast/gather 给叶子
+
+机间 (CPU proxy @ head):
+  等 GPU 通过 connFifo / tail 交付数据
+  → ncclCollNet->iallreduce(send, recv, count, dtype, redOp, mhandles, &req)
+  → test(req) 直到完成
+  → 更新 head/credit，让 GPU 继续
+```
+
+#### 12.4.2 Kernel 侧（COLLNET_DIRECT AllReduce 摘要）
+
+`RunWorkColl<…, NCCL_ALGO_COLLNET_DIRECT, …>`（`all_reduce.h`）按 tid 分段：
+
+| 线程角色 | 条件 | 行为 |
+|----------|------|------|
+| **Scatter** | 有 up | 把 `sendbuff` 分片送到 heads（`prims.scatter`，带 `headRank/shift`） |
+| **Reduce→Net** | `out != -1` 且有 down | 收叶子 + reduce，`recvReduceDirectSend` 发到 **collnet out** |
+| **直送 Net** | head 无 down | 本 head 直接 `send` / UB 下 notify |
+| **Gather** | 有 up | 从 heads `directGather` 回 `recvbuff` |
+| **Bcast from Net** | 有 out | 从 collnet 收结果 再广播给 down |
+
+`direct->out == comm->nRanks` 表示 **网络伪 peer**，由 CollNet 传输的 conn 承接，而不是另一个 GPU rank。
+
+#### 12.4.3 Proxy 侧 progress（`sendProxyProgress`）
+
+状态机概要（`coll_net.cc`）：
+
+```text
+ncclProxyOpReady
+  → 初始化 sub->base/posted/received/transmitted/done
+  → ncclProxyOpProgress
+
+Progress 循环 (每 sub / group):
+  [posted]  通知 GPU 可用 slot（写 sendHead / GDR sync）
+  [received] 等 GPU 写完 (recvTail / connFifo.size)
+  [transmitted] 有序地发起插件调用:
+       collNetIallreduce 或 collNetRegIallreduce
+       (以及 iallgather / ireducescatter 变体)
+  [done]    test 完成，归还 credit，推进 step
+```
+
+要点：
+
+1. **`COLLNET_GROUP_NSUBS`（8）**：多个 sub 组合成 group，控制 outstanding 与偏移计算。  
+2. **强顺序**：`ordered` 保证 collnet op 跨 sub 的 transmitted 顺序，满足插件/交换机有序假设。  
+3. **注册缓冲（UB）**：`sub->reg` + `isOneRPN` 时，插件可 **直接碰用户 GPU buffer**（`collNetRegIallreduce`），减少中间 `region` 拷贝；多 RPN 时常需中间缓冲保证连续性。  
+4. **与 NET 的差异**：progress 热点是 **`iallreduce` + test**，不是 `ibv_post_send` 链；底层插件内部可能仍用 verbs，但对 NCCL 透明。
+
+### 12.5 机制要点小结
+
+| 机制 | 说明 |
+|------|------|
+| **Offload** | 跨节点 reduce 语义下沉到 CollNet 插件/交换机 |
+| **Head/Rail** | 每节点少量 GPU 对接网络，降低 NIC 争用与边数 |
+| **GPU–Proxy 握手** | `connFifo` + head/tail（可 GDR）实现无锁流水 |
+| **双算法** | Chain（深机内链）vs Direct（NVSwitch 机内扁平 + 多 head） |
+| **与 NVLS 协同** | 有 NVLS 时 heads 对齐 NVLS；`nvls.out` 可接 CollNet（`connectNvls`） |
+| **失败回退** | setup 任一环节失败 → `collnetEnable=0`，退回 Ring/Tree+NET |
+
+### 12.6 在 8×H200 + 400G RoCE 上的含义
+
+- **有 SHARP 等 CollNet 后端**：多机 AllReduce 可显著减少主机侧点对点 RDMA 与 proxy 负担。  
+- **仅有 RoCE、无 CollNet 插件**：本节流程 **整条不发生**；`COLLNET_ENABLE=1` 被否决。  
+- CollNet **不替代** 机内 NVLS；机内仍可由 NVLS / P2P 完成到 head 的聚合。
+
+---
+
+## 13. 节点内 NVLS AllReduce：原理、机制与实现流程
+
+> 代码主线：`src/transport/nvls.cc`、`src/graph/connect.cc`（`connectNvls`）、`src/device/all_reduce.h`（`NCCL_ALGO_NVLS`）、CUDA Multicast API（`cuMulticast*`）。
+
+### 13.1 原理：NVLS 解决什么问题
+
+节点内传统 AllReduce：
+
+```text
+Ring:  O(N) 步 NVLink 单向传递 + reduce
+Tree:  O(log N) 步，但仍是多次 P2P
+```
+
+在 **NVSwitch 全互联（如 H200 NV18）** 上，硬件支持 **Multicast（多播）内存**：
+
+- 一次写到 **MC 地址**，NVSwitch 把数据分发给订阅该 multicast group 的 GPU  
+- 结合 reduce 语义，可实现 **近似一步的机内规约/广播**（逻辑上远少于 ring 的 N-1 步）
+
+**NVLS（NVLink SHARP）** 在 NCCL 中的含义：
+
+> 利用 **CUDA Multicast + NVSwitch**，在节点内用 UC（unicast）缓冲与 MC（multicast）视图协作，完成 AllReduce 的 reduce + broadcast，而 **不经过 NIC / proxy**。
+
+```text
+Ring 机内:   GPU0 → GPU1 → … → GPU7 → … (多步 P2P)
+NVLS 机内:  各 GPU ─scatter→ head 相关 MC/UC 路径 ─reduce/bcast→ gather
+             数据面在 GPU kernel + NVSwitch，无 ibv_post_send
+```
+
+### 13.2 核心机制
+
+#### 13.2.1 Multicast Group（CUDA）
+
+`ncclNvlsGroupCreate` / 相关分配路径：
+
+```text
+cuMulticastCreate(mcHandle, prop)     // 创建 MC 对象
+cuMulticastAddDevice(mcHandle, dev)   // 本 GPU 加入
+cuMulticastBindMem / BindAddr         // 把 UC 物理内存绑到 MC
+cuMemMap(mcptr, …, mcHandle)          // 得到 GPU 可访问的 MC 映射
+```
+
+节点内 ranks 通过 **shareable handle**（导出/导入或 UDS）共享同一 MC group：
+
+- rank0 create + export  
+- 其它 rank `ncclNvlsGroupConnect` import  
+- 再 `AddDevice` + `Bind*`  
+
+结果：同一逻辑缓冲存在：
+
+| 视图 | 含义 |
+|------|------|
+| **UC（unicast）** | 本 GPU 私有映射，用于本地读写、credit |
+| **MC（multicast）** | 写一次、多 GPU 可见（经 NVSwitch） |
+
+#### 13.2.2 Heads 与伪 peer
+
+`connectNvls`（`connect.cc`）：
+
+```text
+channel->nvls.nHeads = nHeads
+channel->nvls.up[h]  = nRanks + 1 + h     // 伪 peer：NVLS head 槽
+channel->nvls.down   = nRanks + 1 + headRank
+channel->nvls.headRank = 本 rank 是否为某 head，否则 -1
+channel->nvls.out    = -1 或 nRanks（接 CollNet 时）
+```
+
+- **`up[]`**：逻辑上连到各个 head 的 NVLS 连接  
+- **`down`**：head 侧对应的下行  
+- 真实 peer 编号 ≥ `nRanks` 表示 **NVLS 传输对象**，不是另一个 MPI rank  
+
+#### 13.2.3 Credit / head-tail 同步（无大数据缓冲的 conn）
+
+`ncclNvlsSetup` 为每个 head×channel 配置：
+
+```text
+Reduce  方向: UC credit  (send head/tail)  ↔  MC credit (recv，带 NCCL_NVLS_MIN_POLL)
+Broadcast 方向: MC → UC 对称的一对 conn
+buffs[SIMPLE] = NULL   // 数据走 multicast 映射的用户/注册缓冲语义，不靠常规 ring buffer
+stepSize = nvlsChunkSize
+```
+
+GPU kernel 用 **head/tail 轻量握手** 控制 reduce/bcast 步，而不是像 NET 那样大块 staging + proxy。
+
+#### 13.2.4 注册用户缓冲（可选加速）
+
+`ncclNvls` 路径支持把 **用户 buffer 绑进 MC**（`cuMulticastBindAddr` 等），`work->regUsed` 时 scatter/gather 可走 **零拷贝/最小拷贝** 语义（kernel 中 `nelem=0` 的分支表示注册路径）。
+
+### 13.3 初始化流程（节点内）
+
+```text
+[1] ncclNvlsInit
+      NVLS_ENABLE、gpuCount、MULTICAST_SUPPORTED
+      → nvlsSupport
+
+[2] ncclTopoCompute(PATTERN_NVLS)
+      要求 NVS 存在且 ccMin≥90
+      单机 force minChannels=maxChannels（均匀 heads）
+
+[3] AllGather 后 nvlsChannels；失败则 nvlsSupport=0
+
+[4] ncclNvlsTuning
+      nChannels / chunkSize / treeMaxChunkSize
+
+[5] connectNvls
+      填 channel.nvls 字段；多机再算 treeUp/Down
+
+[6] ncclNvlsSetup
+      可与 parent 共享 nvlsResources
+      分配 UC/MC credit 内存 (nvlsAllocateMem)
+      initNvlsChannel
+      配置 peers[nRanks+1+h] 的 send/recv conn
+      H2D 拷贝到 devPeers
+
+[7] ncclNvlsBufferSetup
+      更大块 UC/MC 数据缓冲（按 channel/head/协议）
+
+[8] 多机: ncclNvlsTreeConnect
+      机间 tree 用 P2P transport 连接 treeUp/Down
+```
+
+### 13.4 单机 NVLS AllReduce 运行时流程（`oneNode`）
+
+`RunWorkColl<AllReduce, T, RedOp, NCCL_ALGO_NVLS, SIMPLE>` 且 `work->oneNode`（`all_reduce.h`）：
+
+线程块按 warp 组划分（总数约 `NCCL_MAX_NTHREADS`）：
+
+| 角色 | tid 区间（逻辑） | 做什么 |
+|------|------------------|--------|
+| **Scatter** | 前段 | 从 `sendbuff` 按 head 分片 `prims.scatter` → `nvls->up` |
+| **Gather** | 中段 | 从 `nvls->up` `prims.gather` → `recvbuff` |
+| **Reduce/Bcast** | 仅 `headRank != -1` | 通过 `nvls->down` 做 `directRecvDirectSend`：MC 路径上的 reduce+broadcast |
+
+```text
+单机逻辑流水（简化）:
+
+  所有 rank:
+    Scatter:  用户 sendbuff 分片送到各 head 的 NVLS 连接
+
+  Head ranks:
+    在 MC/UC 上完成 reduce，再 broadcast 结果
+
+  所有 rank:
+    Gather:  从 NVLS 连接收集到用户 recvbuff
+
+同步: 组间 named barrier / Primitive 内部 head-tail
+无:   proxy 线程、ibv_post_send、CollNet
+```
+
+数据划分：
+
+- `loopCount = nHeads * chunkSize`  
+- 每 head 负责交错的 chunk（`headRank * chunkSize` 偏移）  
+- `regUsed` 时减少显式拷贝量  
+
+### 13.5 多机时 NVLS 如何嵌入（对照，非纯节点内）
+
+`work->oneNode == false` 时同一 kernel 模板扩展为：
+
+```text
+Scatter / Gather: 仍机内 NVLS
+Head Reduce:  directRecvDirectSend 目标含 nvls->out
+             → 把机内规约结果送给「网络侧」(CollNet 或 NVLS_TREE 的上联)
+Head Bcast:   从网络收回后再经 NVLS 广播
+```
+
+另有 **`NCCL_ALGO_NVLS_TREE`**：
+
+- 机内：NVLS  
+- 机间：经典 tree（P2P/NET），**不要求 CollNet**  
+- 单机被 tuning 禁用  
+
+这与「纯节点内 NVLS AllReduce」的差异：节点内段机制相同，多了机间边。
+
+### 13.6 机制要点小结
+
+| 机制 | 说明 |
+|------|------|
+| **CUDA Multicast** | NVSwitch 上硬件多播内存，支撑高效 reduce/bcast |
+| **UC + MC 双映射** | 本地控制面 + 多播数据面 |
+| **Heads** | 并行多轨规约，提高 NVSwitch 利用率 |
+| **Credit 同步** | 轻量 head/tail，可 `NCCL_NVLS_MIN_POLL` |
+| **全 GPU 数据面** | 节点内不经 proxy；与 CollNet/NET 的 CPU progress 模型本质不同 |
+| **注册缓冲** | 可选把用户内存绑入 MC，降低拷贝 |
+| **资源共享** | `ncclCommSplit` 等同节点 parent 可共享 `nvlsResources` |
+
+### 13.7 与 Ring 机内 AllReduce 的对比
+
+| 维度 | Ring（机内） | NVLS（机内） |
+|------|--------------|---------------|
+| 步数 | O(N) 环步 | 逻辑上 O(1) 量级的 scatter/reduce/gather 结构 |
+| 链路 | NVLink P2P peer | NVSwitch multicast + head 并行 |
+| CPU | 无 proxy（纯机内） | 无 proxy |
+| 依赖 | 通用 | SM90+、multicast、NVS、驱动 |
+| 调优 | nChannels、LL/LL128/Simple | `nvlsChannels`、`nvlsChunkSize`、nHeads |
+
+### 13.8 在 8×H200 NV18 上的含义
+
+- 硬件与拓扑 **高度契合** NVLS（NVSwitch + Hopper）。  
+- 单机训练/单机 nccl-tests：开 NVLS 后 AllReduce 应优先走本节路径，**网卡空闲**。  
+- 多机：节点内仍用本节机制，节点间另接 Tree 或 CollNet。  
+- 若 `MULTICAST_SUPPORTED=0` 或 `NVLS_ENABLE=0`，退回 Ring/Tree@NVLink，仍快，但不是硬件多播规约。
+
+---
+
+## 14. 推荐配置与排查清单
+
+### 14.1 本机推荐
 
 ```bash
 # 训练网卡（排除 eth0/1）
@@ -542,7 +951,7 @@ export NCCL_IB_ROCE_VERSION_NUM=2
 # 纯 RoCE 无插件时可保持 0 或省略
 ```
 
-### 12.2 A/B 实验建议
+### 14.2 A/B 实验建议
 
 | 实验 | 目的 |
 |------|------|
@@ -551,25 +960,28 @@ export NCCL_IB_ROCE_VERSION_NUM=2
 | `COLLNET=1` vs `0` + 查 CollNet devices | 验证插件是否真实介入 |
 | 固定其它变量，只改一个开关 | 避免与 GDR/HCA/DEBUG 混杂 |
 
-### 12.3 检查清单
+### 14.3 检查清单
 
 - [ ] `nvidia-smi topo -m` 确认 NV18 与 PIX 配对  
 - [ ] `show_gids` 确认 400G 与管理口分离  
 - [ ] INIT 日志中 NVLS available / CollNet devices  
 - [ ] 单机不要期望 CollNet  
 - [ ] 多机 RoCE 不要假设 CollNet=1 有收益  
-- [ ] 性能问题区分「机内算法」与「机间 NET/post_send」
+- [ ] 性能问题区分「机内 NVLS」与「机间 CollNet/NET/post_send」  
+- [ ] 确认 CollNet 时看 `iallreduce` 路径而非仅 `COLLNET_ENABLE=1`  
 
 ---
 
-## 13. 结论
+## 15. 结论
 
 1. **`NCCL_NVLS_ENABLE`** 控制是否启用 **NVSwitch 上的 NVLS（CUDA Multicast）路径**；在 8×H200 NV18 上，这是 **节点内算法的核心开关**（默认 2=自动探测）。  
 2. **`NCCL_COLLNET_ENABLE`** 控制是否尝试 **CollNet 插件型跨节点 offload**；受插件、节点数、graph 多重否决。  
-3. **单机**：CollNet 恒关；NVLS 1/0（或 2 探测成败）决定能否用 NVLS 多播 vs Ring/Tree@NVLink。  
-4. **多机纯 RoCE 无插件**：CollNet 1/0 **无实质差别**；NVLS 影响机内与 NVLS_TREE，**机间仍是 400G NET**。  
-5. **多机 + SHARP/CollNet**：CollNet 1/0 才有机间路径质变；可与 NVLS 组合。  
-6. 两个开关 **不能替代** 对 NET 路径（`ibv_post_send`、NIC 亲和、平台抖动）的分析；见 `ibv_post_send_ms_stall_analysis.md`。
+3. **节点间 CollNet**：head/rail + 插件 `iallreduce` + GPU–proxy 流水；与点对点 `ibv_post_send` 模型本质不同（见第 12 节）。  
+4. **节点内 NVLS AllReduce**：UC/MC 双映射 + heads + GPU kernel scatter/reduce/gather；不经 proxy（见第 13 节）。  
+5. **单机**：CollNet 恒关；NVLS 1/0 决定多播 vs Ring/Tree@NVLink。  
+6. **多机纯 RoCE 无插件**：CollNet 1/0 无实质差别；NVLS 影响机内与 NVLS_TREE，机间仍是 400G NET。  
+7. **多机 + SHARP/CollNet**：CollNet 1/0 有机间路径质变；可与 NVLS 组合（机内 NVLS + 机间 CollNet）。  
+8. 两个开关 **不能替代** 对 NET 路径（`ibv_post_send`、NIC 亲和、平台抖动）的分析；见 `ibv_post_send_ms_stall_analysis.md`。
 
 ```text
 总结一张图:
@@ -580,6 +992,7 @@ export NCCL_IB_ROCE_VERSION_NUM=2
      ▼           ▼
   NVLS_ENABLE  COLLNET_ENABLE
   节点内多播    跨节点插件 offload
+  (第13节)      (第12节)
      │           │
      │           ├─ 无插件 / 单机 → 设 1 也等于 0
      │           └─ 有 SHARP+多机 → 1 vs 0 质变
@@ -590,11 +1003,12 @@ export NCCL_IB_ROCE_VERSION_NUM=2
 
 ---
 
-## 14. 修订记录
+## 16. 修订记录
 
 | 日期 | 内容 |
 |------|------|
-| 2026-07-10 | 初稿：结合 H200+400G 拓扑与 init/nvls/coll_net/tuning 源码，完整说明两开关语义、否决链、组合矩阵与验证方法 |
+| 2026-07-10 | 初稿：两开关语义、否决链、组合矩阵与验证方法 |
+| 2026-07-10 | 增补第 12 节 CollNet 节点间机制/流程/原理；第 13 节 NVLS 节点内 AllReduce 机制/流程/原理 |
 
 ---
 
@@ -602,14 +1016,15 @@ export NCCL_IB_ROCE_VERSION_NUM=2
 
 | 主题 | 位置 |
 |------|------|
-| NVLS 参数与 init | `src/transport/nvls.cc`：`ncclNvlsInit` / `ncclNvlsTuning` / `ncclNvlsTreeConnect` |
+| NVLS 参数与 init | `src/transport/nvls.cc`：`ncclNvlsInit` / `ncclNvlsTuning` / `ncclNvlsSetup` / `ncclNvlsGroupCreate` / `ncclNvlsTreeConnect` |
 | CollNet env / threshold | `src/init.cc`：`CollnetEnable`、`CollNetNodeThreshold`、graph 计算与 setup |
 | collNetSupport | `src/include/coll_net.h` |
 | 算法 enable 矩阵 | `src/graph/tuning.cc`（约 496–511 行逻辑） |
 | NVLS 图搜索条件 | `src/graph/search.cc`：`NCCL_TOPO_PATTERN_NVLS` |
-| CollNet 图连接 | `src/graph/connect.cc`：`connectCollNet` |
-| CollNet 传输 | `src/transport/coll_net.cc` |
+| CollNet / NVLS 图连接 | `src/graph/connect.cc`：`connectCollNet` / `connectNvls` |
+| CollNet 传输与 proxy | `src/transport/coll_net.cc`：`ncclCollNetSetup`、`sendProxyProgress`、`collNetIallreduce` |
 | AllReduce NVLS kernel | `src/device/all_reduce.h`：`NCCL_ALGO_NVLS` |
+| AllReduce CollNet Direct kernel | `src/device/all_reduce.h`：`NCCL_ALGO_COLLNET_DIRECT` |
 | 参数表 | `notes/nccl_params.md` |
 
 ## 附录 B：与其它笔记的关系
@@ -618,5 +1033,6 @@ export NCCL_IB_ROCE_VERSION_NUM=2
 |------|------|
 | `ibv_post_send_ms_stall_analysis.md` | 机间 NET 门铃尖峰；NVLS/CollNet 不能直接当根因或银弹 |
 | `nccl_thread_model.md` | CollNet / NET 走 proxy；NVLS 正常路径无 proxy progress |
-| `ncclIbIsend_analysis.md` | NET 数据面 isend 链路 |
+| `ncclIbIsend_analysis.md` | NET 数据面 isend 链路（与 CollNet `iallreduce` 对照） |
 | `allreduce-channel-c8-pair-slow-analysis.md` | 含 NVLS 多播可用时的案例观察 |
+| `nccl_ib_send_recv_cts_flow.md` | 普通 NET CTS 流程（CollNet 不走此路径） |
