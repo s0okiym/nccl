@@ -252,7 +252,7 @@ planner->unlaunchedPlansHead = planQueue.head;       // 1639
 
 要点：
 - 预算 `budget`（`1607-1610`）：`inArgsBytes`（能塞进 kernel args 的字节）、`outArgsBytes`（FIFO 里最多用一半，
-  持久化/graph 模式放大到 1<<30）。`ncclTestBudget`（`294`）判断「这批 work 是否放得下」。
+  持久化/graph 模式放大到 1<<30）。`ncclTestBudget`（`294`）判断「这批 work 是否放得下」。**具体怎么算见 6.5**。
 - **先 drain coll，再 drain bcast，最后 drain p2p**（`1616-1625`）——注释解释：p2p 不是集合操作，
   若先切 p2p，不同 rank 切 kernel 的位置会不一致，导致「最短 channel 优先」的 channel 选择器发散而死锁。
 - 持久化（CUDA graph 捕获）走 `ncclDevWorkStorageTypePersistent`，否则走 `Fifo`；`finishPlan` 会尽量把
@@ -304,6 +304,122 @@ planner->unlaunchedPlansHead = planQueue.head;       // 1639
 
 > 至此，plan 完工：它知道用哪个 kernel、开几个 channel（grid 维度）、每个 channel 干什么（work batch）、
 > CPU 要替哪些 channel 跑网络（proxyOp）。
+
+### 6.5 预算怎么算 / 一个 group 切几个 plan（深入）
+
+把 task 切成 plan 的唯一依据是 **「这批 work 放不放得下」** 的预算检查。预算由 `ncclKernelPlanBudget`
+（`enqueue.cc:289`）描述，核心判定函数是 `ncclTestBudget`（`enqueue.cc:294`）。
+
+#### (1) 预算 = 两类存储资源的容量
+
+Plan 的 work（`ncclDevWorkColl`）可以落在两处之一，预算就是这两处的容量上限（`enqueue.cc:1607-1610`）：
+
+```c
+budget.inArgsBytes  = comm->workArgsBytes - sizeof(ncclDevKernelArgs);   // args 区剩余空间
+budget.outArgsBytes = persistent ? (1<<30) : comm->workFifoBytes / 2;    // FIFO 区（或持久 buf）
+```
+
+| 量 | 取值 | 出处 |
+|---|---|---|
+| `workArgsBytes`（kernel 启动参数缓冲区总大小） | **4 KiB**（`4<<10`） | `device.h:485` `ncclMaxKernelArgsSize`；`init.cc:610` 与 param 取 min |
+| `sizeof(ncclDevKernelArgs)`（args 头：comm 指针/channelMask/workBuf…） | ~32 B | `device.h:473-481` |
+| **`inArgsBytes`** | ≈ **4064 B** | = 4096 − 32 |
+| `workFifoBytes`（work FIFO 环大小） | 默认 **1 MiB** | `init.cc:394` `NCCL_WORK_FIFO_BYTES_DEFAULT = 1<<20` |
+| **`outArgsBytes`**（非 graph） | **512 KiB** | = workFifoBytes/2 |
+| **`outArgsBytes`**（graph/persistent） | **1 GiB** | `1<<30` |
+
+> 为什么 FIFO 只用一半？让「上传下一个 plan」和「GPU 消费当前 plan」流水重叠——host 往另一半写时不必等 GPU
+> 把前一半排空（`waitWorkFifoAvailable` `enqueue.cc:1216` 只在未消费量超过整环时才 spin）。
+
+#### (2) `ncclTestBudget`：两种「放得下」取并集（`enqueue.cc:294`）
+
+```c
+batchBytes = nWorkBatches * sizeof(ncclDevWorkBatch);   // sizeof(ncclDevWorkBatch)=16 B (device.h:392-410)
+ok |= (batchBytes + workBytes <= inArgsBytes);                                  // 方式A：batch+work 全进 args
+ok |= (batchBytes <= inArgsBytes) && (workBytes <= outArgsBytes);               // 方式B：batch进args, work进FIFO
+```
+
+- **batch 头永远在 args 区**（它必须内联在 `ncclDevKernelArgs` 之后，device 用 `blockIdx.x` 直接索引 `batchZero[]`）。
+- **work 数据**可进 args（方式A，最快，免走 FIFO）或进 FIFO（方式B）。`finishPlan`（`212-213`）会在最后判定：
+  若 `sizeof(args)+batchBytes+workBytes ≤ workArgsBytes`，就把 `workStorageType` 降级成 `Args`——
+  即「先按 FIFO 调度，最后能塞进 args 就塞进去」。
+
+#### (3) 预算被什么消耗（关键：work 按 coll 计，batch 按 channel 计）
+
+这是最容易看走眼的地方：
+
+- **`workBytes`**：每个 coll task 增加一次 `workNode->size`（`enqueue.cc:854`），即 **1 个 `ncclDevWorkColl` ≈ 128 B（16 对齐）**，
+  **与 channel 数无关**——channel 信息（`channelLo/Hi` + `cbd`）编码在这一个 work 结构里（`device.h:284-316`）。
+- **`nWorkBatches`**：`ncclAddWorkBatchToPlan` **每个 channel 调一次**（`enqueue.cc:650/803`），需要时新增一个 16 B 的
+  batch 头。所以一个 allreduce 摊到 C 个 channel，就消耗 **C 个 batch 头**。
+
+一句话：**channel 数主要吃 batch 预算，不吃 work 数据预算**。
+
+#### (4) 切 plan 的两轮判定：估算 + 实际 worst-case
+
+`scheduleCollTasksToPlan`（`enqueue.cc:576`）里有两处预算检查：
+
+**① 估算轮**（`586-604`）——粗略估计本 plan 能装几个 coll，只给 `nPlanColls` 一个上限：
+```c
+int nBatches = divUp(nPlanColls, 4);   // 粗略：假设每 4 个 coll 共用一个 batch（忽略 channel 展开）
+if (!ncclTestBudget(budget, nBatches, workBytes + workNode->size)) goto plan_full;
+nPlanColls += 1; workBytes += workNode->size;
+```
+
+**② 实际 packing 轮**（`610-855`）——真正按 channel 切、真正建 batch，每塞一个 coll 前做**权威检查**（worst-case）：
+```c
+// 标准路径 enqueue.cc:707（collnet 路径在 627）：
+if (!ncclTestBudget(budget, plan->nWorkBatches + nChannels, plan->workBytes + workNode->size))
+    return ncclSuccess;          // 放不下 → 本 plan 封口，剩余 coll 留给下一个 plan
+```
+`plan->nWorkBatches + nChannels` = 「为这个 coll 在它每个 channel 上各留一个新 batch 的最坏情况」。
+**一旦这个检查失败，函数立即返回——这才是 plan 边界的真正决定者**；估算轮只是乐观上界，避免多迭代。
+
+#### (5) 具体演算
+
+- **单个 allreduce**（C 个 channel，~128 B 的 1 个 work）：消耗 `workBytes=128`、`nWorkBatches=C`（C×16 B）。
+  方式A 检查 `C×16 + 128 ≤ 4064` → C ≤ 246，现实 C 远小于此 → **必然走方式A，work 进 args，1 个 plan**。
+- **大 group 里 K 个 allreduce**（同 func，可共享 channel 的 batch）：work 按 ~128 B/coll 线性涨；
+  batch 按 `channel × ceil(coll/64)` 涨（offsetBitset 每批 64 位）。args 装不下 work 时切到方式B：
+  work 进 512 KiB FIFO → `512K/128 ≈ 4096 个 coll` 的 work 数据才填满。
+
+结论：**一次普通 allreduce 几乎总是 1 个 plan**；只有当 group 里 coll 非常多（或海量 channel 的 batch 头爆掉 args）才切出多个 plan。
+
+#### (6) 一个 group 切几个 plan：没有固定公式，是动态 do-while
+
+`ncclLaunchPrepare`（`enqueue.cc:1583-1636`）就是个循环，**每次循环产出一个 plan，直到 planner 里的 task 全部排空**：
+
+```c
+do {
+  memset(&planner->wipPlan, 0, ...);
+  plan = pool.alloc();
+  ...
+  scheduleCollTasksToPlan(comm, plan, &budget);   // 尽量塞满这个 plan（被 (4)② 的 worst-case 检查封口）
+  finishPlan(comm, plan);
+  if (plan->workBytes != 0) enqueue(planQueue, plan);
+} while (nTasksColl + nTasksP2p + nTasksBcast != 0 || 还有 sym/ce/rma task);
+```
+
+所以 **plan 数 = ceil(总 task / 每 plan 可容纳 task)**，但「每 plan 可容纳 task」是运行时按预算动态算出来的，不是常量。
+
+#### (7) 多 plan 的安排（drain 顺序 + 发射节奏）
+
+**同一 plan 内的 drain 顺序**（`enqueue.cc:1616-1625`）：**先 coll、再 bcast、最后 p2p**。原因：p2p 不是集合操作，
+若先切 p2p，不同 rank 切 kernel 的位置会不一致，导致 channel 选择器发散而死锁——所以**先把所有 coll 排空，保证各 rank 切点一致**。
+
+**多 plan 的发射**（`doLaunches` `group.cc:338-379`）：
+- `planQueue` 里每个 plan = 一次 `cuLaunchKernelEx`（一个 kernel）。
+- 按 **clique**（同 `intraComm0` 的兄弟 comm）成组发射；clique 内各 comm 的 plan **轮流、按轮**发射。
+- `ncclLaunchModeGroup` 下用 intra-barrier 把各 comm 的进度对齐：每轮各 comm 各发一个 plan，barrier 同步，
+  `moreRounds` 由 barrier 归约结果决定；最后一轮调 `ncclLaunchFinish` 收尾。
+- 即 **plan 之间是串行启动的**（依次 `cuLaunchKernelEx`），靠 CUDA stream 顺序 + barrier 保证依赖。
+
+#### (8) CUDA graph（persistent）的差异
+
+- `outArgsBytes = 1<<30`（1 GiB）→ FIFO 几乎不会成为切 plan 的理由，**graph 捕获时通常就 1 个 plan**。
+- 但 work 不再走环形 FIFO（捕获时不能动态写环），而是 `cudaMallocAsync` 一块**专用持久 device buf** +
+  `cudaMemcpyAsync` 拷过去（`uploadWork` `enqueue.cc:1270-1286`），graph 重放时复用。
+- persistent plan 的回收走 graph 析构回调（`persistentDestructor` `enqueue.cc:1528`），不是普通 `reclaimPlan`。
 
 ---
 
@@ -540,6 +656,7 @@ proxy 的网络收发也以同样的 step 序列推进。所以各 rank 只要�
 | 算法/协议选择 | `enqueue.cc:363` (ncclPrepareTasks) / `441` (ncclGetAlgoInfo) |
 | buffer 注册 + work | `enqueue.cc:302` (ncclTasksRegAndEnqueue) |
 | plan 切分 | `enqueue.cc:1568` (ncclLaunchPrepare) / `576` (scheduleCollTasksToPlan) |
+| 预算 / 切几个 plan | `enqueue.cc:289/294` (ncclKernelPlanBudget/ncclTestBudget) / `1607-1610` (预算) / `707` (worst-case 封口)；详见 §6.5 |
 | channel 数据切分 | `enqueue.cc:659-701` (countLo/Mid/Hi) / `2182` (calcCollChunking) |
 | work batch 构造 | `enqueue.cc:121` (ncclAddWorkBatchToPlan) / `203` (finishPlan) |
 | 发射编排 | `group.cc:309` (doLaunches) |
@@ -563,7 +680,7 @@ proxy 的网络收发也以同样的 step 序列推进。所以各 rank 只要�
 
 2. **一次 group 一定只 launch 一个 kernel 吗？**
    不一定。work 量超过单 plan 预算时，`ncclLaunchPrepare` 会切出多个 plan（多个 kernel），
-   `doLaunches` 多轮逐个发射（`group.cc:338-379`）。
+   `doLaunches` 多轮逐个发射（`group.cc:338-379`）。**预算怎么算、什么时候切多个 plan，详见 §6.5。**
 
 3. **grid 维度是 rank 数吗？**
    不是。grid.x = **channel 数**（`plan->channelMask` 置位数，`enqueue.cc:1756`）。每个 block 处理一个 channel。
