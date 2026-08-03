@@ -454,7 +454,7 @@ C 与 A/B 的 CTS FIFO 元素（`ncclIbSendFifo`：addr/size/rkeys/nreqs/tag/idx
 | SendComm / RecvComm 总尺寸 | ~47KB / ~43KB | ~235KB / ~250KB | ~5-6× |
 | **未注册（可迁移）热池/comm** | **~12KB（3 页）** | **~85KB（21 页）** | **~7×** |
 
-关键构建事实：`NET_PROFILER` 在 Makefile（`NET_PROFILER ?= 0`）与 CMake 中**默认均关闭**。若构建显式开启（`NET_PROFILER=1`），`ncclIbRequest` 再增 ~1.15KB（`pInfo[8]`），`reqs[256]` 达 ~360KB/comm，所有内存面差异再放大 ~5 倍——排查时应先确认该开关。
+构建事实（**已确认**）：`NET_PROFILER` 在 Makefile（`NET_PROFILER ?= 0`）与 CMake 中**默认均关闭**；实际测试环境使用 `make -j src.build` 且未设置该变量，故 `NCCL_ENABLE_NET_PROFILING` 未参与编译，`pInfo[8]` 不存在，`ncclIbRequest` 为 264B——profiling 开销嫌疑正式排除，本节所有基准数字（`reqs[256]` = 66KB/comm）即实际环境数字。
 
 ### 9.2 每操作新鲜缓存行（nreqs=1、ndevs=1、1 QP 典型情形）
 
@@ -477,4 +477,4 @@ C 与 A/B 的 CTS FIFO 元素（`ncclIbSendFifo`：addr/size/rkeys/nreqs/tag/idx
 2. **每操作内存访问延迟：差异显著**。C 每操作新鲜行 2~3 倍，且来自大 4~12 倍的旋转域：A 的未注册热池 ~12KB 可常驻 L1（48KB），C 的 ~85KB 必然落到 L2；每条新鲜行平均取数延迟差 3~8 倍（L1 ~4-5 cycles vs L2 ~15-40 cycles）。**有效窗口被 cache miss 拉长 ~1.5~2.5 倍，而非指令数**。
 3. **NUMA 页迁移暴露面（最大且可证的差异）**：旋转中的未注册页 A 3 页 vs C 21 页/comm（收发两 comm：6 页 vs 42 页）。numa balancing 扫描周期内 C 被 unmap 后又触碰的页数高一个量级 → hinting fault + 页迁移概率同比升高。
 4. **迁移后重填成本**：全部热旋转域 A ~78KB vs C ~455KB（含 pinned 数组的缓存效应）→ ~6 倍。
-5. 最大不确定项：构建是否开 `NET_PROFILER=1`（默认关）；若开，request 池 66KB→360KB/comm，内存面差异再放大 ~5 倍，且 profiling 间接调用成为真实的每操作 CPU 开销。
+5. ~~构建是否开 `NET_PROFILER=1`~~（**已排除**：测试环境为 `make -j src.build` 默认构建，NET_PROFILER=0，profiling 未编译进二进制）。
