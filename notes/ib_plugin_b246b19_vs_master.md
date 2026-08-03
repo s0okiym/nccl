@@ -427,7 +427,7 @@ C 与 A/B 的 CTS FIFO 元素（`ncclIbSendFifo`：addr/size/rkeys/nreqs/tag/idx
 | 作用环节 | `ncclIbIsend`→`ncclIbMultiSend`→`ibv_post_send`（发射路径） | 抢占/迁移**之后**的恢复阶段 | `ncclIbTest` 每 CQE 处理（完成探测路径） |
 | A (b246b19) | 写 ~10 个字段（request 仅 ~64B）；memset 1 个 WR + 1 个 sge；1 次 post_send。约几百条指令，~10-20 条缓存行，同处一两页，热身后必热 | 热簿记 ~8KB（`reqs[64]`×64B + `fifoReqs` + 小 WR 数组）≈ 128 条缓存行、2~3 个页 | `req = base->reqs + (wr_id & 0xff)` 一次索引 → `events[i]--` → recv 读 imm。单体内联，每 CQE 几十条指令 |
 | C (net_ib) 额外 | request ~250B+（profiling 编译时含 `pInfo[8]` 达 KB 级）：多写 `id`、`sendReqs[slot]`、`sendReqsCnt[slot]++`、`remCmplsRecords.elems[slot][r]`、`pInfo[0].nEventHandles=0`；每 QP 走 `GetNqpsPerRequest`+`GetQpForRequest`（assert+取模）+`AddEvent` 间接取 devBase；MultiSend 内每 QP 每 request 有 `std::min`、`sentData` 检查、profiling 块 | 热簿记 ~100KB–1MB+（`reqs[256]`，profiling 时单 request KB 级；另加 `sendReqs[256][8]`、`sendReqsCnt`、`recvReqs`）≈ 1.6K–16K 条缓存行、25~250+ 个页；`id%256` 旋转访问，整个数组都在热工作集内 | helper 链：`RetrieveFromCompletion`（isSend/opcode/匹配方案分支 + `recvReqs[wr_id]` 表查）→ `CompletionEventProcess`（opcode 分支、按 nreqs 循环、预投递时 `GetQpByQpNum` 线性扫 QP + 补投 recv WR、profiling 时每 request 每 QP 一次 `ncclProfilerFunction`）→ `IsComplete`/`Complete`。每 CQE 约为 A 的 3~5 倍指令 |
-| 量化效果（量级估计） | C 每消息窗口约为 A 的 2~3 倍 | 迁移后重填：A ≈ 128 行 × ~100ns ≈ 十几 µs 封顶；C 最坏数百 µs~1ms+；跨 NUMA 迁移时转为持续性远端访存（页不迁、线程迁，直至迁回前每次簿记访问都走远端 DRAM） | 32MB 传完时 CQE 成批到达，`do/while` 榨干循环单次驻留 = 每 CQE 成本 × 批量，C 在"最不能被打断"时刻驻留最久 |
+| 量化效果（量级估计，**第①点经第 9 节核算修正**：指令数仅 +10~20%，窗口实为 cache miss 拉长 ~1.5~2.5 倍） | C 每消息窗口约为 A 的 2~3 倍 | 迁移后重填：A ≈ 128 行 × ~100ns ≈ 十几 µs 封顶；C 最坏数百 µs~1ms+；跨 NUMA 迁移时转为持续性远端访存（页不迁、线程迁，直至迁回前每次簿记访问都走远端 DRAM） | 32MB 传完时 CQE 成批到达，`do/while` 榨干循环单次驻留 = 每 CQE 成本 × 批量，C 在"最不能被打断"时刻驻留最久 |
 
 ### 逐点展开
 
@@ -436,3 +436,45 @@ C 与 A/B 的 CTS FIFO 元素（`ncclIbSendFifo`：addr/size/rkeys/nreqs/tag/idx
 - **第③点（完成处理单列的原因：时刻最要命）**：32MB 传完瞬间各 QP 的 CQE 成批到达，`do/while(totalWrDone>0)` 在一次调用内连续处理整批，下一个集合步就等这批完成探测。A 每 CQE 一次索引+自减；C 每 CQE 走 helper 链、多分支、按 nreqs 循环，预投递开时按 `wc->qp_num` 线性反查 QP 并补投，profiling 编译时还有每 request 每 QP 的间接调用。单 CQE 成本 × 成批量 = C 在最不能被打断的时刻驻留最久，被抢占即推迟完成探测，与推迟发射同价。
 
 **串联**：①③ 决定窗口长度（被打中的概率），② 决定单次代价（被打中一次有多疼）。A = 短窗口 + 轻代价 → 统计免疫；C = 长窗口 + 重代价 → 同样的调度抖动被放大成可见的 500µs 级毛刺。（以上指令数/耗时为量级估计，非实测数据。）
+
+## 9. 工作集精细核算（对第 7、8 节量化估计的修正）
+
+**修正声明**：第 8 节"C 每消息窗口约为 A 的 2~3 倍（指令量）"估计偏高。按结构体定义逐字段、逐操作核算后：每操作**指令数**差异仅 ~10-20%，且 C 在分片数学与 CTS 事件处理上反而更省；真实差异在**内存几何**（热池尺寸、旋转域、新鲜缓存行数）——窗口是被 cache miss 拉长的，不是被指令数拉长的。
+
+### 9.1 结构体精确尺寸
+
+| 结构 | A. b246b19 | C. net_ib | 倍数 |
+|---|---|---|---|
+| `ncclIbRequest` | 88B（2 缓存行） | 264B（5 缓存行；多 events[4]/devBases[4]、`id`、`sentData[128]`、`rmaProxyCtx`） | 3× |
+| 请求池 `reqs[]` | 64×88B = 5.6KB（2 页） | 256×264B = 66KB（17 页） | 12× |
+| slot→请求表 | `fifoReqs[64][8]` = 4KB | `sendReqs` 16KB + `sendReqsCnt` 1KB + `recvReqs` 2KB = 19KB | ~5× |
+| CTS FIFO（pinned） | 32KB | 128KB | 4× |
+| size 回传区（pinned） | 2KB + 2KB | 8KB + `cmplsRecords[256]`×160B = 40KB | 10× |
+| `qps[]` | 128×16B = 2KB | 128×~96B = 12KB（多 ECE 标志 + init/rtr/rts 三份 QP 属性） | 6× |
+| SendComm / RecvComm 总尺寸 | ~47KB / ~43KB | ~235KB / ~250KB | ~5-6× |
+| **未注册（可迁移）热池/comm** | **~12KB（3 页）** | **~85KB（21 页）** | **~7×** |
+
+关键构建事实：`NET_PROFILER` 在 Makefile（`NET_PROFILER ?= 0`）与 CMake 中**默认均关闭**。若构建显式开启（`NET_PROFILER=1`），`ncclIbRequest` 再增 ~1.15KB（`pInfo[8]`），`reqs[256]` 达 ~360KB/comm，所有内存面差异再放大 ~5 倍——排查时应先确认该开关。
+
+### 9.2 每操作新鲜缓存行（nreqs=1、ndevs=1、1 QP 典型情形）
+
+| 操作 | A | C | 倍数 |
+|---|---|---|---|
+| isend | fifo slot 1 + fifoReqs 1 + request 2 = **4 行** | ctsFifo 1 + sendReqs 1 + sendReqsCnt 1 + request 5 + remCmplsRecords.elems 1 = **9 行** | ~2.2× |
+| irecv | request 2 + remFifo slot 1 = **3 行** | request 5 + recvReqs 1 + cmplsRecords 3（memset 136B）+ remCtsFifo 1 = **10 行** | ~3.3× |
+| test（每 CQE） | ~1-2 行 | ~3-6 行 | ~2-3× |
+
+### 9.3 每操作 CPU 工作逻辑逐项核对
+
+- **完全相同**：isend 骨架（CTS 判断→自旋→tag 匹配→size 截断）、WR 链构造、post_send、poll/榨干循环。
+- **C 略多**：request 初始化多写 `id` + 大数组 memset（GetRequest 清 `devBases[4]`/`events[4]`）；MultiSend 多 `sentData[qpIndex]=true`、`remCmplsRecords.elems` 两笔 store；irecv 多 `recvReqs` 表写 + `cmplsRecords` 136B memset；test 每 CQE 多匹配方案分支与 `sendReqsCnt` 簿记。
+- **C 反而更省**：分片 chunk 只算 1 遍（A 每 QP 每 request 算 2 遍 `DIVUP`）；CTS signaled 完成**不计入** recv request events（A 要 `AddEvent` 且 recv 完成多等一个 CQE）。
+- **净效果**：每操作指令数差异 ~10-20%（几十~一两百 cycles），不是窗口差异的主因。
+
+### 9.4 修正后的因果链
+
+1. 每操作指令数：差异小（~10-20%）。
+2. **每操作内存访问延迟：差异显著**。C 每操作新鲜行 2~3 倍，且来自大 4~12 倍的旋转域：A 的未注册热池 ~12KB 可常驻 L1（48KB），C 的 ~85KB 必然落到 L2；每条新鲜行平均取数延迟差 3~8 倍（L1 ~4-5 cycles vs L2 ~15-40 cycles）。**有效窗口被 cache miss 拉长 ~1.5~2.5 倍，而非指令数**。
+3. **NUMA 页迁移暴露面（最大且可证的差异）**：旋转中的未注册页 A 3 页 vs C 21 页/comm（收发两 comm：6 页 vs 42 页）。numa balancing 扫描周期内 C 被 unmap 后又触碰的页数高一个量级 → hinting fault + 页迁移概率同比升高。
+4. **迁移后重填成本**：全部热旋转域 A ~78KB vs C ~455KB（含 pinned 数组的缓存效应）→ ~6 倍。
+5. 最大不确定项：构建是否开 `NET_PROFILER=1`（默认关）；若开，request 池 66KB→360KB/comm，内存面差异再放大 ~5 倍，且 profiling 间接调用成为真实的每操作 CPU 开销。
