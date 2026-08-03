@@ -1,14 +1,18 @@
-# ib_plugin 数据路径关键函数实现对比：b246b19 vs master
+# IB 数据路径关键函数实现三方对比：插件 b246b19 vs 插件 master vs NCCL 内部 net_ib
 
-对比对象：`src/ib_plugin.c` 中数据路径核心函数 `ncclIbIsend` / `ncclIbMultiSend` / `ncclIbIrecv` / `ncclIbPostFifo` / `ncclIbIflush` / `ncclIbTest` 及辅助函数 `ncclIbGetRequest` / `ncclIbFreeRequest` / `ncclIbAddEvent`。
+对比对象：数据路径核心函数 `ncclIbIsend` / `ncclIbMultiSend` / `ncclIbIrecv` / `ncclIbPostFifo` / `ncclIbIflush` / `ncclIbTest` 及辅助函数 `ncclIbGetRequest` / `ncclIbFreeRequest` / `ncclIbAddEvent`，来自三个实现：
 
-- 基线：`b246b19`（2024-06，对应 net v5–v8 API）
-- 目标：`master`（2026-04，对应 net v6–v11 API）
-- 方法：逐函数提取两个版本的函数体做 diff。
+- **A. 插件 b246b19**：`nccl-rdma-sharp-plugins` 仓库 `src/ib_plugin.c` @ `b246b19`（2024-06，net v5–v8 API，1851 行单文件，C）
+- **B. 插件 master**：同文件 @ `master`（2026-04，net v6–v11 API，2335 行单文件，C）
+- **C. NCCL 内部实现**：`nccl` 仓库 `src/transport/net_ib/p2p.cc`（2026-07 快照，876 行，C++；为 net_ib 目录重构的一部分，连接建立在 `connect.cc`、初始化在 `init.cc`、弹性恢复在 `p2p_resiliency.cc`、GIN 在 `gin.cc`）
 
-**总体结论先行：两个版本的数据路径算法几乎完全一致**——FIFO/CTS 信用机制、多 QP 条带化、adaptive routing、gpuFlush、完成处理流程在 master 上没有任何重构。全部差异归结为四类：(1) API 类型拓宽（int→size_t、phandle）；(2) 设备计数抽象从 `ndevs` 改为 `vProps.ndevs`/`nDataQps`（v9 虚拟设备）；(3) 新增异步致命错误检查；(4) `ncclIbTest` 错误报告增强与 events 数组扩到 4 槽。
+- 方法：逐函数提取三个版本的函数体做 diff。
+
+**总体结论先行**：A→B 数据路径算法几乎完全一致（详见第一部分）；C 是对同一套 FIFO/CTS 协议的**深度重构**——协议骨架（CTS FIFO + RDMA_WRITE 数据 + WRITE_WITH_IMM 完成通知 + 128B 对齐多 QP 分片 + gpuFlush）保持兼容，但请求标识、wr_id 编码、QP 选择、完成检索、多请求 size 回传、AR 触发条件等全部重新设计，并新增接收端匹配方案（BY_ID/BY_INDEX）、弹性恢复（resiliency）、recv WR 预投递、OooRQ 感知与内置 profiling（详见第二部分）。
 
 ---
+
+# 第一部分：插件 b246b19（A）vs 插件 master（B）
 
 ## 1. ncclIbIsend（发送入口）
 
@@ -177,4 +181,137 @@ TRACE 行同步改为字符串化输出。
 | `ncclIbTest` | 无 | **+fatal 检查（2 处）、events 2→4 槽、错误 WARN 字符串化、reqSize 修正、NULL 防护** | 完成判定等价；错误处理行为不同（fatal 快速上抛 vs 等超时） |
 | `ncclIbGetRequest`/`FreeRequest`/`AddEvent` | 无 | 无（逐行一致） | 等价 |
 
-**一句话总结**：从 b246b19 到 master，send/recv/flush 的传输算法零改动；`ncclIbTest` 是唯一有实质行为变化的函数（异步致命错误即时上抛 + 4 设备支持 + 错误日志可读性）；其余差异全部是 net v9/v10 API 拓宽带来的签名调整和设备计数字段的 vProps 化改名。
+**一句话总结（A vs B）**：从 b246b19 到 master，send/recv/flush 的传输算法零改动；`ncclIbTest` 是唯一有实质行为变化的函数（异步致命错误即时上抛 + 4 设备支持 + 错误日志可读性）；其余差异全部是 net v9/v10 API 拓宽带来的签名调整和设备计数字段的 vProps 化改名。
+
+---
+
+# 第二部分：NCCL 内部 net_ib/p2p.cc（C）与插件两版（A/B）的重要差异
+
+C 是 NCCL 主仓库对 IB 传输的 C++ 重构（net_ib 目录化：p2p.cc 仅 876 行，连接/初始化/弹性/GIN 拆到独立文件）。**线上协议与 A/B 同源**（CTS FIFO 元素结构、idx 递增、RDMA_WRITE + WRITE_WITH_IMM、128B 对齐分片、gpuFlush 1 字节 RDMA_READ 均保留），但数据路径内部机制有系统性差异。
+
+## 1. 跨函数的全局性差异（最重要的四点）
+
+**① 请求标识与 wr_id 编码全面重做**
+
+| | A/B（插件） | C（net_ib p2p.cc） |
+|---|---|---|
+| 请求标识 | 请求数组下标（`req - base->reqs`） | 显式 `req->id = fifoHead`（单调递增） |
+| 发送 WR 的 wr_id | 每字节打包一个**请求数组下标**：`(reqs[r]-reqs) << (r*8)` | 每字节打包 **FIFO slot**：`(slot & 0xff) << (r*8)` |
+| 接收 WR 的 wr_id | 请求数组下标 | **slot** |
+| flush WR 的 wr_id | 请求数组下标 | 请求下标 + `NCCL_IB_FLUSH_REQ_WR_ID_OFFSET`（与数据完成区分） |
+| 发送侧完成检索 | `reqs[wr_id & 0xff]`，再逐字节解出组内各请求 | `sendReqs[wr_id & 0xff][0]` 得 slot，再遍历 `sendReqs[slot][j]` |
+| 接收侧完成检索 | `reqs[wr_id & 0xff]`（与发送共用一张表） | `recvReqs[wc->wr_id]`（按 slot 注册的 recv 请求表）；BY_ID 方案下用 `recvReqs[imm_data % MAX]` |
+
+**② 接收端匹配方案可选：`NCCL_IB_RECEIVER_SIDE_MATCHING_SCHEME`（C 新增）**
+
+- `BY_INDEX`（默认）：与 A/B 一致——单请求时 imm 携带 size，多请求时 size 由发送端 RDMA 写入接收侧的 per-slot 数组。
+- `BY_ID`（C 独有）：imm 携带**请求 ID**（`reqs[0]->id % UINT32_MAX`），接收端按 ID 查 `recvReqs` 表，size 用 `wc->byte_len` 累加到 `req->recv.aggSize`。
+
+**③ Resiliency（弹性/故障恢复）子系统——C 独有，贯穿所有数据路径函数**
+
+- `p2p_resiliency.cc`/`p2p_resiliency_recovery.cc`（约 12 万字节）实现 QP 故障后的连接重建；A/B 完全没有对应物（B 只有 fatal 计数上抛）。
+- `ncclIbMultiSend`：**选择性重传**——`req->send.sentData[qpIndex]` 记录每个 QP 是否已送达，重发时跳过已送达 QP 并前移地址（p2p.cc:161-170）。
+- `ncclIbTest`：入口先跑 `ncclIbResiliencyProgress()`；完成错误不再直接返回 `ncclRemoteError`，而是交给 `ncclIbResiliencyHandleCompletionError()` 尝试恢复；容忍 events 变负、容忍检索到 unused 请求（INFO 后跳过）。
+- `ncclIbIrecv`：resiliency 下预先给所有 dev 填 `devBases`（"a recv request can be served by any device"）。
+- `ncclIbPostFifo`：resiliency 下 CTS **总是 signaled**（A/B 仅 `slot == ctsQp->devIndex` 时）。
+
+**④ QP 选择策略：确定性按请求 ID 映射 vs 轮询游标**
+
+- A/B：发送/接收各维护轮询游标（`base.qpIndex`、`base.devIndex`），每次 +1 取模。
+- C：`ncclIbCommBaseGetQpForRequest(base, req->id, i, &qp, &qpIndex)`（isend/irecv/multisend 统一按请求 ID 确定性选 QP）；CTS QP 用 `ncclIbRecvCommGetQpForCts(comm, req->id)`。配合 resiliency 可以在设备不可用时换 QP 重发。
+
+## 2. 逐函数差异
+
+### ncclIbIsend
+
+| 方面 | A/B | C |
+|---|---|---|
+| FIFO 等 CTS | `slots[0].idx == fifoHead+1`，自旋等齐 nreqs | **相同**（`std::atomic_thread_fence(seq_cst)` 替代 `__sync_synchronize()`） |
+| tag 匹配 / size 截断 / sanity WARN | 有 | **相同** |
+| slot 状态管理 | `fifoReqs[slot]` 匹配即占用；发完立即 `memset` 清槽 | `sendReqs[slot][]` + `sendReqsCnt[slot]` 计数；**延迟到 `ncclIbRequestComplete` 中计数归零才清槽**（防止多请求组内早清） |
+| events 填充 | 按 nEvents 轮询 QP `ncclIbAddEvent` | 按 `GetQpForRequest(req->id, i)` 选 QP 加 event；语义相同 |
+| sizes 源缓冲 | 无（在 MultiSend 内按需填 `remSizesFifo.elems`） | isend 中无条件 `remCmplsRecords.elems[slot][r] = size` |
+| profiling | B 接受 `phandle` 但**不用** | `NCCL_ENABLE_NET_PROFILING` 下记录 `pHandle`、每 QP 起 `ncclProfilerNetEventStart` |
+| resiliency | 无 | `sentData` 清零初始化 |
+
+### ncclIbMultiSend
+
+| 方面 | A/B | C |
+|---|---|---|
+| immData | 单请求=size；多请求=0/1 标志 | BY_INDEX 同 A/B；**BY_ID=请求 ID** |
+| 多请求 size 回传目标 | `remSizesFifo`（每 slot 一个 int 数组） | `remCmplsRecords`（每 slot 一个 `ncclIbRequestCompletionRecord`，含 sizes[] + completions[]） |
+| AR 触发条件 | `comm->ar && size > IB_AR_THRESHOLD` | **额外条件 `!(remOooRq && localOooRq)`**：两端 RQ 都支持乱序时无需 0 字节 imm 尾部触发完成 |
+| 分片偏移跟踪 | `req->send.offset` 累积（含空片也加 chunkSize），`MIN(size-offset, chunk)` | 局部 `sendOffsets[]` + `std::min(size-offset, length)`；**并记录 `sentData[qpIndex]`** |
+| 空片处理 | `sg_list=NULL, num_sge=0` | `num_sge=0`（等价） |
+| QP 迭代 | `qpIndex=(qpIndex+1)%nqps` 轮询 | `GetQpForRequest(req->id, i)` 确定性映射 |
+| 重传 | 无 | resiliency 下跳过已送达 QP |
+| 尾部 imm WR | 条件相同（多请求或 AR 大消息） | 相同；BY_ID 时 imm 为 ID |
+| profiling / TRACE | 无 / 少量 | 每 QP profiling 事件 + `ncclIbPrintWr` 完整 WR 链转储 |
+
+### ncclIbIrecv
+
+| 方面 | A/B | C |
+|---|---|---|
+| recv WR 投递 | 每次 irecv 在所有数据 QP 上 post 空 recv WR | **支持 `prepostReceiveWorkRequests`**：预投递后 irecv 不再 post，完成时在 `ncclIbCompletionEventProcess` 中按 `wc->qp_num` 找到原 QP 补投 |
+| 请求登记 | 无表 | `recvReqs[req->id % MAX] = req`（供完成检索） |
+| 完成记录 | 依赖对端写 `sizesFifo[slot]` | 本地 `cmplsRecords[slot]`（sizes + per-QP completions 标志），irecv 时清零 |
+| CTS QP 选择 | `base.devIndex` 轮询游标 | `ncclIbRecvCommGetQpForCts(comm, req->id)` 按 ID 选择 |
+| localElem 填充 | addr/rkeys/nreqs/size/tag/idx | **完全相同** |
+| fifoHead++ 时机 | PostFifo 之后 | 相同 |
+
+### ncclIbPostFifo
+
+| 方面 | A/B | C |
+|---|---|---|
+| signaled 条件 | `slot == ctsQp->devIndex`（QP 周期排空机制，注释同源） | 相同条件 **或 resiliency 时总是 signaled** |
+| signaled 完成是否计入 recv 请求 events | **是**——`ncclIbAddEvent(req, ctsQp->devIndex)`，recv 请求要等自己的 CTS 排空才算完成 | **否**——CTS 完成在 test 中作为 `IBV_WC_RDMA_WRITE` 分支仅 TRACE 忽略 |
+| rkey | `remDevs[remDevIdx].fifoRkey` | `remDevs[remDevIdx].rkey`（字段改名） |
+
+### ncclIbIflush
+
+三者几乎一致：只对最后一个非零 size 的 recv flush、每 dev 在自连接 gpuFlush QP 上 post signaled 1 字节 `IBV_WR_RDMA_READ`、逐 dev `ncclIbAddEvent`。C 的唯一区别是 wr_id 加 `NCCL_IB_FLUSH_REQ_WR_ID_OFFSET`，使 test 能靠 `(opcode==IBV_WC_RDMA_READ, wr_id-offset)` 明确识别 flush 完成（A/B 靠"recv 侧的 RDMA_READ 完成即 flush"这一隐式约定）。
+
+### ncclIbTest
+
+| 方面 | A/B | C |
+|---|---|---|
+| 结构 | 单体内联（A 94 行 / B 107 行） | 重构为 5 个 helper：`RetrieveFromCompletion` / `RequestIsComplete` / `RequestComplete` / `LogCompletionWithError` / `CompletionEventProcess` |
+| 轮询框架 | `while(1){...; if (totalWrDone==0) return;}` | `do{...}while(totalWrDone>0)`——**行为等价**（都是榨干当前可用 CQE 后返回） |
+| 完成判定 | events[0..3] 全 0 | 相同；resiliency 下另调 `ncclIbResiliencyRequestIsComplete` |
+| dev 轮询跳过条件 | `r->events[i]`（隐式依赖 devBases 非空） | `!r->devBases[i] \|\| (events[i]==0 && !resiliency)`——更显式，容忍发送端未用全部设备 |
+| 完成错误 | 返回 `ncclRemoteError` | resiliency 关闭时相同；**开启时进入恢复流程**；另加 `printIbWcStatusHint()` 给出排查提示 |
+| recv size 上报 | 单请求取 imm、多请求取 `sizesFifo` | BY_INDEX 相同；BY_ID 用 `aggSize`（byte_len 累加）；多请求或 sizes[0]>0 时报 `cmplsRecords->sizes` |
+| send 完成收尾 | `ncclIbFreeRequest` | 额外 `sendReqsCnt[slot]--`，归零才清 `sendReqs[slot]`（与 isend 的延迟清槽配合） |
+| CTS / 未知完成 | 走通用 events 递减路径 | 显式分支：CTS 完成忽略、未知 opcode WARN + `ncclInternalError` |
+| fatal 检查 | B 有（2 处），A 无 | 与 B 相同（2 处 `ncclIbStatsCheckFatalCount`） |
+| profiling | 无 | 完成时逐 QP `ncclProfilerNetEventStop` |
+
+### 辅助函数
+
+- `ncclIbGetRequest`：三者逻辑一致（找 UNUSED 槽）；C 额外清零 `devBases`/`events` 并置 `sock=NULL`。
+- `ncclIbFreeRequest` / `ncclIbAddEvent`：三者一致（C 的 AddEvent 经 `ncclIbGetNetCommDevBase()` 取 devBase，多一层间接）。
+
+## 2.5 协议兼容性要点
+
+C 与 A/B 的 CTS FIFO 元素（`ncclIbSendFifo`：addr/size/rkeys/nreqs/tag/idx）、idx 握手、128B 对齐分片、gpuFlush 机制保持同构，但 **wr_id 编码、imm 语义（BY_ID）、多请求 size 回传布局（remSizesFifo vs remCmplsRecords）、recv WR 预投递**均不同——这些属于通信双方内部约定，两端必须同版本；net_ib 作为 NCCL 内置传输天然两端一致，而插件协议与 NCCL 内部插件协议各自成体系，不可混用。
+
+## 三方差异总览表
+
+| 维度 | A. 插件 b246b19 | B. 插件 master | C. NCCL net_ib p2p.cc |
+|---|---|---|---|
+| 语言/组织 | C，单文件 | C，单文件 | C++，net_ib 目录（p2p/connect/init/gin/resiliency 拆分） |
+| 传输算法骨架 | FIFO/CTS + RDMA_WRITE + 128B 分片 | 同 A（逐行级一致） | 同构但全面重构 |
+| 请求标识 | 数组下标 | 同 A | 显式 `req->id` + slot 表（sendReqs/recvReqs） |
+| 接收匹配方案 | 仅 BY_INDEX | 仅 BY_INDEX | BY_INDEX（默认）/ **BY_ID** 可选 |
+| QP 选择 | 轮询游标 | 同 A | 按请求 ID 确定性映射 |
+| 多设备支持 | ≤2 | ≤4（vProps/nDataQps） | ≤4（vProps）+ 非对称拓扑 |
+| fatal 错误上抛 | 无 | 有（stats 计数） | 有（同 B） |
+| **故障恢复** | 无 | 无 | **resiliency：QP 重建 + 选择性重传 + 错误容忍** |
+| AR 触发 | size>阈值 | 同 A | 额外要求非 OooRQ 双端 |
+| recv WR 预投递 | 无 | 无 | **有（可选）**，完成时按 qp_num 补投 |
+| CTS 完成计入 recv events | 是 | 是 | 否（显式忽略分支） |
+| profiling | 无 | 接口接受但不用 | **内置**（每 QP start/stop 事件） |
+| GIN（GPU 发起） | 无 | 头文件预留，未实现 | **有（gin.cc，IPut 请求类型）** |
+| 错误日志 | 数字 status | 字符串化 + reqSize + HCA | 字符串化 + HCA + `printIbWcStatusHint` |
+
+**一句话总结（三方）**：A→B 是"同一实现的小步演进"（API 拓宽 + fatal 检查 + 4 设备）；B→C 是"同一协议的重新实现"——传输骨架不变，但请求/wr_id 标识体系、QP 选择、完成检索全部重设计，并引入 resiliency 故障恢复、BY_ID 匹配、recv 预投递和内置 profiling 四个 A/B 完全没有的能力。
