@@ -315,3 +315,99 @@ C 与 A/B 的 CTS FIFO 元素（`ncclIbSendFifo`：addr/size/rkeys/nreqs/tag/idx
 | 错误日志 | 数字 status | 字符串化 + reqSize + HCA | 字符串化 + HCA + `printIbWcStatusHint` |
 
 **一句话总结（三方）**：A→B 是"同一实现的小步演进"（API 拓宽 + fatal 检查 + 4 设备）；B→C 是"同一协议的重新实现"——传输骨架不变，但请求/wr_id 标识体系、QP 选择、完成检索全部重设计，并引入 resiliency 故障恢复、BY_ID 匹配、recv 预投递和内置 profiling 四个 A/B 完全没有的能力。
+
+---
+
+# 第三部分：性能分析——net_ib 对 NUMA balancing / runqueue delay 敏感而插件 b246b19 免疫的根因
+
+背景现象：nccl-tests（all_reduce_perf，2 机 16 卡，32MB buffer）下，C（NCCL 内部 net_ib）在 `ncclIbMultiSend` 构造 WR 及 `ibv_post_send` 时出现毫秒级延迟毛刺，整体延迟 ~500µs 抖动，且对 `kernel.numa_balancing` 开关和 runqueue delay 类调度参数非常敏感；A（插件 b246b19）在相同环境延迟稳定 ~260µs，对两者免疫。
+
+## 1. 结论
+
+**最可能的原因：C 的热路径上"未注册、可被内核迁移"的簿记内存工作集从 A 的几页膨胀到几十~几百页，且按 `id % 256` 旋转索引访问，使 NUMA balancing 的 hinting fault 扫描 + 页迁移在每次发送中高频命中；同时 C 单次 proxy progress 调用的连续 CPU 时间更长，proxy 线程更易被调度器迁移（runqueue delay 敏感点）。A 的热路径只触碰 2~3 页未固定内存，预热后稳定驻留本地节点，故免疫。**
+
+毛刺的本质不是代码阻塞，而是内核对该线程的页（hinting fault → 页迁移，单次数百 µs~数 ms，THP 拆分/规整时更糟）和线程本身（跨 NUMA 迁移）做动作；代码差异决定的是暴露面大小。
+
+## 2. 机制链
+
+1. `kernel.numa_balancing=1`：内核周期性 unmap 进程用户态页做 NUMA 扫描；线程再访问该页触发 hinting fault，可能伴随页迁移，迁移期间线程睡眠数百 µs~数 ms。
+2. 关键前提：被 `ibv_reg_mr` 注册过的页由 RDMA 驱动 pin 住，**NUMA balancing 无法迁移**——CTS FIFO、远端 size 回传区、gpuFlush host 内存在三个实现中均已注册，不是差异来源。暴露在迁移风险下的是**未注册的簿记内存**。
+3. 每次 isend/irecv/test 必触碰的未固定内存：
+
+| 结构 | A. 插件 b246b19 | C. NCCL net_ib |
+|---|---|---|
+| 请求池 | `reqs[64]` × ~64B ≈ 4KB | `reqs[256]` × ~250B（含 `sentData[128]`）≈ **64KB**；若编译开 `NCCL_ENABLE_NET_PROFILING`，`pInfo[8]`/request 可再膨胀至 **~1MB** |
+| slot→请求映射 | `fifoReqs[64][8]` = 4KB | `sendReqs[256][8]` = 16KB + `sendReqsCnt[256]` + `recvReqs[256]` |
+| 访问模式 | slot 紧凑复用，热页 **2~3 页** | `id % 256` **旋转索引**，连续发送跨整个数组跨页 stride 访问 |
+| 每次 isend 额外写 | 无 | `sentData` memset、`pInfo[0].nEventHandles=0`；irecv 还有 `cmplsRecords` 双 memset |
+| **未固定热工作集合计** | **~8KB（几页）** | **~100KB–1MB+（几十~几百页）** |
+
+  （`NET_IB_MAX_REQUESTS = NCCL_NET_MAX_REQUESTS(32) × NCCL_NET_IB_MAX_RECVS(8) = 256`；插件为 `8 × 8 = 64`。）
+
+4. C 每次发送写分布在几十~几百页中的不同 slot，numa balancing 扫描周期内几乎必然踩到刚被 unmap 的页 → hinting fault → 页迁移，线程睡在 MultiSend 构 WR 或紧随的 `ibv_post_send`（写 QP 驱动缓冲 + doorbell MMIO，同样受线程/页位置影响）中——与观测的毛刺位置吻合。
+5. C 的 proxy 线程单次 progress 调用连续 CPU 时间更长（见第 3 节加重因素），更易被调度器判为可迁移的 CPU hog；线程一旦跨节点迁移，后续 comm 内存与 HCA doorbell 全部变跨节点访问——解释对 runqueue delay 的敏感性。
+6. A 的热工作集只有 2~3 页，预热后稳定驻留 proxy 线程本地节点，扫描命中概率极低 → 对两个开关都不敏感。500µs vs 260µs 的均值差 = 高频小迁移 + 偶发大迁移的叠加。
+
+## 3. 加重因素（C 独有）
+
+- `ncclIbTest` 榨干循环内多做：按 `wc->qp_num` 线性反查 QP（`ncclIbCommBaseGetQpByQpNum`）、补投预投递的 recv WR、profiling stop 事件；
+- isend/irecv/multisend 的 profiling 簿记写入（即使未挂 profiler 插件，`pInfo` 字段写仍执行；插件 master 接受 `profFunction` 但从不使用，零热路径成本）；
+- resiliency 字段维护（`sentData` memset 等），即使该功能默认关闭。
+
+## 4. 已排除的嫌疑
+
+- `wrap_ibv_post_send`：A/C 均为裸调 `qp->context->ops.post_send`，无锁；
+- 内存分配：两边 `ncclIbMalloc` 都是 page 对齐 `posix_memalign`，无差别；
+- CTS 自旋等待、完成榨干循环框架：等价；
+- QP 选择（`(id*nQps)%nqps` vs 轮询游标）：常数级差异，与 ms 毛刺无关。
+
+## 5. 验证方法
+
+1. 跑 all_reduce_perf 时对比两种实现 `/proc/vmstat` 的 `numa_hint_faults`、`numa_pages_migrated`、`numa_pte_updates` 增量——C 应显著非零，A 接近零（最直接证据）。
+2. `perf record -e page-faults -p <proxy线程>` 或 `perf sched latency`，确认毛刺时刻对应 fault/migration。
+3. 确认 NCCL 构建是否定义 `NCCL_ENABLE_NET_PROFILING`（`nm` 查 `ncclProfilerFunction` 是否被链入 so）——若是，`reqs[]` 还要大一个量级。
+4. 反向验证：对 C 的 comm 簿记内存 `mlock`，毛刺应消失。
+
+## 6. 缓解方向
+
+- 短期（已验证有效）：关 `kernel.numa_balancing`；proxy 线程绑定到 HCA 所在 NUMA 节点（numactl / NCCL CPU affinity）。
+- 代码层（针对根因）：`reqs[]`/`sendReqs`/`recvReqs` 等未注册簿记内存 `mlock` 或绑节点分配（`mbind`/`MADV_HUGEPAGE`）；profiling 簿记改为"无 profiler 插件时完全跳过"；缩小 `NET_IB_MAX_REQUESTS` 或紧凑化 slot 复用，削减热工作集。
+
+## 7. 补充：关闭 numa_balancing 后的残余毛刺——CPU 调度（runqueue delay）敏感性分析
+
+现象：关闭 `kernel.numa_balancing` 后 C 的毛刺缓解 >99% 但不归零，仍对 CPU 调度（runqueue delay 类参数）敏感；A 不受影响。
+
+### 结论
+
+**残余毛刺来自"全自旋、零让出"的数据路径被调度器抢占/迁移——这是 A、C 共有机制，故无法归零；C 更敏感是因为每次 net 回调的 CPU 工作量更大（暴露窗口更长）且热工作集更大（被抢占/迁移后的恢复成本更高）。**
+
+### 机制链
+
+1. 整条延迟关键路径没有任何让出 CPU 的点（A、C 共有）：proxy 服务线程 busy-poll（`proxy.cc` 主循环仅在"本次循环零推进"时才 `std::this_thread::yield()`，稳态下几乎不 yield）→ `ncclIbIsend` 中 `while (slots[r].idx != idx);` 自旋等 CTS → `ncclIbMultiSend` 逐 QP 构 WR + `ibv_post_send` → `ncclIbTest` 的 `do/while` 榨干 CQE。**任何调度事件（timer tick、同核 kworker/IRQ/CUDA 线程唤醒抢占、线程迁移）的延迟都 1:1 注入集合通信关键路径**——残余毛刺无法靠关 numa balancing 归零的原因。
+2. proxy 线程为 SCHED_OTHER、无优先级/隔离保护，被抢占后需等 runqueue 重新调度（`runqueue_delay`/migration cost 类参数的调节点）；若被迁移则缓存全冷。
+3. C 比 A 敏感的代码级原因——暴露窗口与单次代价：
+
+| 因素 | A. b246b19 | C. net_ib | 调度敏感性后果 |
+|---|---|---|---|
+| 每次 net 回调指令量 | 小：紧凑 request（~64B）、少量簿记 | 大：`sentData[128]` memset、`pInfo` 簿记、`cmplsRecords` 双 memset、`CompletionEventProcess` 多分支、按 `wc->qp_num` 线性反查 QP（`ncclIbCommBaseGetQpByQpNum`）、多层间接调用 | 窗口越长，抢占落在 isend→post_send→test 链中间的概率越高 |
+| 被迁移后恢复成本 | 热工作集 ~8KB，L1/L2 常驻 | ~100KB–1MB+，且 `id%256` 旋转访问，未迁移时也持续 L2/L3 miss | 每次迁移需重拉取大工作集，慢尾 10~100 倍于 A |
+| 完成处理 | 单体内联 | 每 CQE 走 helper 链 + 可选补投 recv WR + profiling stop 间接调用 | 榨干循环在高负载下单次驻留更久 |
+
+4. 32MB all_reduce（2 机 16 卡）是大量串行 net op 组成的长链，链上任一处 50~500µs 抢占即表现为端到端抖动。A 并非不被抢占，而是窗口短、恢复代价小，统计上"免疫"。
+
+### 已排除
+
+- resiliency / OooRQ / recv 预投递：默认全关（`IB_RESILIENCY_PORT_FAILOVER=0`、`IB_OOO_RQ=0`、`IB_PREPOST_RECEIVE_WORK_REQUESTS=-2→false`），无恢复线程/心跳流量；
+- isend 的 CTS 自旋逻辑：A、C 逐行一致；
+- async event 线程：两边均每 IB 设备一个、阻塞于 `ibv_get_async_event`，不耗 CPU；
+- `ibv_post_send` 无锁。
+
+### 验证
+
+- 测试期间对 proxy 线程 `perf sched record` → `perf sched latency` + migrations 统计，A/C 对比：预期抢占次数相近，但 C 单次 off-CPU 影响更大；`/proc/<pid>/sched` 看 `nr_migrations`/`nr_involuntary_switches`。
+- 决定性实验：proxy 线程绑隔离核（`isolcpus`/`nohz_full` + IRQ 移离）或 `chrt -f` 提 SCHED_FIFO——C 的残余毛刺收敛到 A 的水平即坐实调度源。
+
+### 缓解
+
+- 系统层：proxy 线程 CPU 隔离 + 绑核（HCA 所在 NUMA）、SCHED_FIFO、IRQ affinity 移离 proxy 核。
+- 代码层：与本部分第 6 节同源——裁剪每 op 簿记（无 profiler 时跳过 pInfo 写）、缩小请求/slot 数组、簿记内存 `mlock`，同时降低页迁移暴露（第 2~6 节）与调度暴露窗口（本节）。
