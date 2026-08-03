@@ -411,3 +411,28 @@ C 与 A/B 的 CTS FIFO 元素（`ncclIbSendFifo`：addr/size/rkeys/nreqs/tag/idx
 
 - 系统层：proxy 线程 CPU 隔离 + 绑核（HCA 所在 NUMA）、SCHED_FIFO、IRQ affinity 移离 proxy 核。
 - 代码层：与本部分第 6 节同源——裁剪每 op 簿记（无 profiler 时跳过 pInfo 写）、缩小请求/slot 数组、簿记内存 `mlock`，同时降低页迁移暴露（第 2~6 节）与调度暴露窗口（本节）。
+
+## 8. "暴露窗口"与"单次代价"三点差异详解
+
+概念定义：
+
+- **暴露窗口**：每条在飞消息上，proxy 线程"打断不得"的连续时间——发送侧是从发现 GPU 投下 send op 到 `ibv_post_send` 把 WR 交给网卡；完成侧是从 CQE 到达到 `ncclIbTest` 处理完、request 标记 done。线程在窗口内被踢下 CPU，集合通信该步原地等待；窗口外（空转等下一条 op）被抢占无影响。窗口越长，调度事件（tick、kworker 唤醒）落入概率越大。
+- **单次代价**：抢占/迁移真正发生时，除"离开 CPU 的时间"（runqueue delay 决定）外，线程恢复后重填缓存/TLB 的成本，正比于热工作集大小。
+- 调度敏感性 ≈ 事件落入窗口的概率 × 单次代价。第①③点作用于前者，第②点作用于后者。
+
+### 三点对照表
+
+| | 第①点：每次回调指令量（→窗口长度） | 第②点：工作集大小（→单次代价） | 第③点：完成处理成本（→窗口长度，发生在最要命时刻） |
+|---|---|---|---|
+| 作用环节 | `ncclIbIsend`→`ncclIbMultiSend`→`ibv_post_send`（发射路径） | 抢占/迁移**之后**的恢复阶段 | `ncclIbTest` 每 CQE 处理（完成探测路径） |
+| A (b246b19) | 写 ~10 个字段（request 仅 ~64B）；memset 1 个 WR + 1 个 sge；1 次 post_send。约几百条指令，~10-20 条缓存行，同处一两页，热身后必热 | 热簿记 ~8KB（`reqs[64]`×64B + `fifoReqs` + 小 WR 数组）≈ 128 条缓存行、2~3 个页 | `req = base->reqs + (wr_id & 0xff)` 一次索引 → `events[i]--` → recv 读 imm。单体内联，每 CQE 几十条指令 |
+| C (net_ib) 额外 | request ~250B+（profiling 编译时含 `pInfo[8]` 达 KB 级）：多写 `id`、`sendReqs[slot]`、`sendReqsCnt[slot]++`、`remCmplsRecords.elems[slot][r]`、`pInfo[0].nEventHandles=0`；每 QP 走 `GetNqpsPerRequest`+`GetQpForRequest`（assert+取模）+`AddEvent` 间接取 devBase；MultiSend 内每 QP 每 request 有 `std::min`、`sentData` 检查、profiling 块 | 热簿记 ~100KB–1MB+（`reqs[256]`，profiling 时单 request KB 级；另加 `sendReqs[256][8]`、`sendReqsCnt`、`recvReqs`）≈ 1.6K–16K 条缓存行、25~250+ 个页；`id%256` 旋转访问，整个数组都在热工作集内 | helper 链：`RetrieveFromCompletion`（isSend/opcode/匹配方案分支 + `recvReqs[wr_id]` 表查）→ `CompletionEventProcess`（opcode 分支、按 nreqs 循环、预投递时 `GetQpByQpNum` 线性扫 QP + 补投 recv WR、profiling 时每 request 每 QP 一次 `ncclProfilerFunction`）→ `IsComplete`/`Complete`。每 CQE 约为 A 的 3~5 倍指令 |
+| 量化效果（量级估计） | C 每消息窗口约为 A 的 2~3 倍 | 迁移后重填：A ≈ 128 行 × ~100ns ≈ 十几 µs 封顶；C 最坏数百 µs~1ms+；跨 NUMA 迁移时转为持续性远端访存（页不迁、线程迁，直至迁回前每次簿记访问都走远端 DRAM） | 32MB 传完时 CQE 成批到达，`do/while` 榨干循环单次驻留 = 每 CQE 成本 × 批量，C 在"最不能被打断"时刻驻留最久 |
+
+### 逐点展开
+
+- **第①点（指令多 = 窗口长）**：发射路径是纯 CPU 工作，指令数即耗时。A 的 request 64 字节、写在同一两条缓存行，WR 数组复用同页；C 多写的字段散布在 `reqs[256]`/`sendReqs`/`sendReqsCnt`/`remCmplsRecords.elems` 多个大数组，不同缓存行 miss 又各添几十~几百 cycle。调度事件在时间轴上近似均匀分布，窗口占比越大，事件落入的期望次数越多。
+- **第②点（工作集大 = 单次代价大）**：抢占分三档——同核短抢占（缓存热，≈上下文切换几 µs）；同核长抢占（L1 被冲，需重填）；被迁移（runqueue delay/migration cost 直接控制，L1+L2 全冷）。重填成本 ≈ 行数 × 每行延迟：A ~128 行最坏十几 µs；C 上万行且 `id%256` 旋转要求整个数组重新捂热。跨 NUMA 迁移更糟：numa balancing 关闭后页不走但线程会走，线程迁到另一 socket 后、迁回之前，每次簿记访问都是远端 DRAM 读——不是一次性毛刺而是持续减速，也抬高了均值延迟（260µs→500µs 中调度贡献的部分）。
+- **第③点（完成处理单列的原因：时刻最要命）**：32MB 传完瞬间各 QP 的 CQE 成批到达，`do/while(totalWrDone>0)` 在一次调用内连续处理整批，下一个集合步就等这批完成探测。A 每 CQE 一次索引+自减；C 每 CQE 走 helper 链、多分支、按 nreqs 循环，预投递开时按 `wc->qp_num` 线性反查 QP 并补投，profiling 编译时还有每 request 每 QP 的间接调用。单 CQE 成本 × 成批量 = C 在最不能被打断的时刻驻留最久，被抢占即推迟完成探测，与推迟发射同价。
+
+**串联**：①③ 决定窗口长度（被打中的概率），② 决定单次代价（被打中一次有多疼）。A = 短窗口 + 轻代价 → 统计免疫；C = 长窗口 + 重代价 → 同样的调度抖动被放大成可见的 500µs 级毛刺。（以上指令数/耗时为量级估计，非实测数据。）
