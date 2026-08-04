@@ -478,3 +478,59 @@ C 与 A/B 的 CTS FIFO 元素（`ncclIbSendFifo`：addr/size/rkeys/nreqs/tag/idx
 3. **NUMA 页迁移暴露面（最大且可证的差异）**：旋转中的未注册页 A 3 页 vs C 21 页/comm（收发两 comm：6 页 vs 42 页）。numa balancing 扫描周期内 C 被 unmap 后又触碰的页数高一个量级 → hinting fault + 页迁移概率同比升高。
 4. **迁移后重填成本**：全部热旋转域 A ~78KB vs C ~455KB（含 pinned 数组的缓存效应）→ ~6 倍。
 5. ~~构建是否开 `NET_PROFILER=1`~~（**已排除**：测试环境为 `make -j src.build` 默认构建，NET_PROFILER=0，profiling 未编译进二进制）。
+
+---
+
+# 第四部分：NCCL_IB_QPS_PER_CONNECTION>1 卡死问题分析（插件 b246b19 + NCCL 2.28 core）
+
+现象：使用 b246b19 插件时，`NCCL_IB_QPS_PER_CONNECTION>1` 导致 nccl-tests rank 卡死。抓取的主线程堆栈：`ncclAllReduce → ncclEnqueueCheck → groupLaunch → ncclCollPreconnect → ncclNvlsTreeConnect → ncclTransportP2pSetup → recvConnect(net.cc) → ncclPollProxyResponse → ncclSocketProgress(非阻塞轮询)`。
+
+## 1. 堆栈解读：主线程是受害者
+
+主线程通过 `ncclProxyCallAsync(ncclProxyMsgConnect)` 让本节点 proxy 服务线程执行插件 `ncclIbAccept`，随后在 `ncclPollProxyResponse` 轮询 16 字节响应。响应不到 = proxy 线程未完成该 Connect 消息。关键推论（`proxy.cc` 的 `proxyProgressAsync` / `ncclPollProxyResponse`）：插件返回**错误**时 proxy 会回错误响应或置 `abortFlag`，主线程会以 `ncclInternalError` + WARN 退出；**静默卡死 ⇒ proxy 线程在无限自旋/阻塞，或已死亡**。定位必须抓 proxy 线程栈。
+
+## 2. 已从代码排除的嫌疑
+
+| 嫌疑 | 验证结果 |
+|---|---|
+| connect/accept 握手依赖 nqps | 双方 `nqps = qpsPerConn × ndevs`；对称配置下 `qpInfo[0..nqps-1]` 全部字段写入后才上线，握手与 nqps 无关 |
+| 数据面 QP 游标错位 | isend/MultiSend/irecv 两侧游标每消息 +1（mod nqps），1:1 同步；且该逻辑与 master **逐行一致**（上游从未修改），非已知 bug |
+| 事件计数平衡 | split=0：1 个 signaled 完成 vs nEvents=ndevs；split=1：nqps vs nqps；CTS/flush 计数两侧平衡 |
+| CQ/QP 容量 | CQ=2×64×qpsPerConn；max_recv_wr=64/QP、max_send_wr=128/QP；QPS=4 远未超限 |
+| NCCL core 读该参数 | 不读（`QPS_PER_CONNECTION` 仅存在于被绕过的内部 net_ib）；listen backlog=16384 |
+| 资源耗尽 | QPS=4 的 QP 数仍远低于 HCA 上限；耗尽走错误路径（报错退出），非静默卡死 |
+
+## 3. 剩余嫌疑（按可能性排序）
+
+1. **proxy 卡死在此前连接的数据路径自旋（前提：卡死非首个 size 首次迭代）**。nccl-tests 按 size 扫描，`ncclCollPreconnect` 在第一次需要 NVLS 算法的 allReduce 才触发 NVLS 连接，此前小 size 的 ring/tree 流量已经过 proxy。b246b19 **没有 fatal-error 上报机制**（master 的 `39fe29d` 才引入 `ncclIbStatsCheckFatalCount`）：若 nqps>1 下某 QP 出错导致 CTS 的 RDMA_WRITE 丢失，proxy 会永久自旋在 `ncclIbIsend` 的 `while (slots[r].idx != idx);`，后续所有 Connect 消息（含 NVLS）得不到处理——主线程恰好以观测到的栈挂住。
+2. **ndevs 跨 rank 不对称 × nqps 放大（b246b19 固有缺陷，master `85b73d3` 已修）**。b246b19 `nqps = qpsPerConn × 本地ndevs` 两端各自计算；master 改为 `max(本地,对端)` 并交换 vProps。若轨道间 NIC 合并结果不同，qpsPerConn=1 时错配被掩盖，>1 时 `qpInfo[]` 索引错位、RTR 到错误/未初始化对端 QP → 包静默丢失 → 握手或首发数据永远等不到完成。验证：对比两机各 dev 的 ndevs 日志。
+3. **未初始化 metadata（`2a632df` 才修）**。connect/accept 的 `meta` 均为未 memset 栈变量；accept 侧 `meta.qpInfo[q].ece*` 仅在对端 `ece_supported` 时写。nqps>1 时 ECE 协商按 QP ×4 发生，`set_ece` 拿垃圾值可致 `modify_qp` 失败走错误路径（理论上报错，但错误处理可能在 proxy 留半死状态）。
+
+## 4. 决定性定位步骤
+
+1. 卡死时 `gdb -p <pid>` → `thread apply all bt`，找 `[Proxy Service]` 线程：栈在 `ncclIbIsend`/`ncclIbTest` 自旋 → 嫌疑 1；在 `ncclIbAccept/Connect` 的 socket progress → 连接互等；线程消失 → 查 core。
+2. `NCCL_DEBUG=INFO NCCL_DEBUG_SUBSYS=INIT,NET,PROXY` 重跑，看最后成功的连接记录与卡住位置。
+3. 确认卡死时机：首个 size 首次迭代即挂（纯连接问题）还是跑过若干 size 后挂（嫌疑 1）。
+4. 对照实验：换 master 插件同环境 QPS=4（含 ECE 修复 `2a632df`/`b2e92a4`、ndevs 错配修复 `85b73d3`、fatal 上抛 `39fe29d`）——若不挂，差异锁定在那 10 个 commit；`NCCL_NET_SHARED_COMMS=0`；`NCCL_IB_SPLIT_DATA_ON_QPS=1`。
+
+### 9.5 插件 master 的工作集核算（三方对照）
+
+结论：**插件 master 的工作集与 b246b19 基本相同，远小于 net_ib**——工作集膨胀完全是 NCCL 内部 C++ 重写（net_ib）引入的。依据：
+
+- 插件 master 的 `include/net.h` 中 `NCCL_NET_MAX_REQUESTS` 仍为 **8**（vendored 头文件未跟随 NCCL core 涨到 32），`MAX_REQUESTS = 8×8 = 64`，与 b246b19 相同；net_ib 为 32×8 = 256。
+- master 的 `ncclIbRequest` ≈ 120B（events/devBases/lkeys 由 2 扩到 4），**仍为 2 缓存行**；没有 net_ib 的 `id`、`sentData[128]`、`rmaProxyCtx` 字段。
+- master 相对 b246b19 无新增热表；`ncclIbStats` 仅 4B，fatal 检查落在常驻热行上。
+
+| 指标 | A. b246b19 | B. 插件 master | C. NCCL net_ib |
+|---|---|---|---|
+| 槽位数 MAX_REQUESTS | 64 | 64 | 256 |
+| `ncclIbRequest` | 88B（2 行） | ~120B（2 行） | 264B（5 行） |
+| 请求池 `reqs[]` | 5.6KB（2 页） | 7.5KB（2 页） | 66KB（17 页） |
+| slot→请求表 | 4KB | 4KB | 19KB |
+| CTS FIFO（pinned） | 32KB | 32KB | 128KB |
+| size 回传区（pinned） | 4KB | 4KB | 48KB |
+| SendComm/RecvComm 总尺寸 | ~47/~43KB | ~50/~46KB | ~235/~250KB |
+| **未注册热池/comm** | **~12KB（3 页）** | **~13.5KB（4 页）** | **~85KB（21 页）** |
+| 每操作新鲜行（isend/irecv） | 4 / 3 | ~4 / ~3 | 9 / 10 |
+
+推论：第 9.4 节的全部机制结论（NUMA 页迁移暴露面、迁移后重填成本、L1/L2 驻留差异）中，B 与 A 同侧——**"插件（b246b19 或 master）vs net_ib"的工作集对比结论一致**，可以预期 master 插件同样对 numa_balancing/runqueue delay 基本免疫。
