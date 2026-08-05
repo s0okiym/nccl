@@ -282,24 +282,44 @@ do {
 
 ### 5.2 op 生产链：从一次集合调用到 SHM 池
 
-完整链路（以一次跨节点 allreduce 为例）：
+生产端严格说就是 `ncclLocalOpAppend`——它是唯一向 SHM 池槽位写入 op 的函数；但完整生产链有四个函数，各司其职：
 
 ```
-ncclAllReduce
-└─ enqueue.cc 规划阶段
-   └─ ncclAddProxyOpIfNeeded（enqueue.cc:108）
-      └─ ncclProxySaveOp(comm, op, &needed)   ← justInquire 模式：只判断要不要 proxy
-         └─ 若需要：堆拷贝 op 挂入 plan->channels[c].proxyOpQueue
-└─ kernel 发射后，strong stream 上的 cudaLaunchHostFunc 回调
-   └─ hostStreamPlanCallback（enqueue.cc:1452）
-      └─ hostStreamPlanTask（enqueue.cc:1436）
-         ├─ uploadProxyOps（enqueue.cc:1392）   ← 重编号 opCount，正式 ncclProxySaveOp
-         └─ ncclProxyStart（proxy.cc:1014）     ← 发布到池并 notify
+ncclProxySaveOp (proxy.cc:602)   ← 入口：按 pattern 把一次集合拆成 per-peer op
+  └─ SaveProxy (proxy.cc:578)    ← 选连接器，决定要不要、发给谁
+      └─ ncclLocalOpAppend (proxy.cc:489)  ← ★ 生产者本体：取槽、写槽、挂链
+ncclProxyStart (proxy.cc:1014)
+  └─ ncclProxyPost (proxy.cc:477)          ← 发布者：挂到池的已发布链 + 唤醒
 ```
 
-**opCount 编码**（`enqueue.cc:1407-1423`）：最低位是 p2p 标记——集合 op：`opCount = (comm->collOpCount << 1) + plan内序号`；p2p op：`(channel 的 p2pOpCount << 1) + 奇数序号`。保存后恢复原值以便 persistent plan（graph 捕获）重放。opCount 是 6.5 节聚合的键。
+#### 5.2.1 两阶段生产：什么时候、在哪个线程
 
-**`ncclProxySaveOp` 的 pattern 分解**（`proxy.cc:602-766`）：把"一次集合"按通信模式拆成 per-peer 的收发 op——
+**阶段一：inquire（dry run），用户线程，集合规划时。** `ncclAddProxyOpIfNeeded`（`enqueue.cc:108`）以 `justInquire` 模式调 `ncclProxySaveOp`——此时**只判断、不写池**（`SaveProxy` 里 `if (justInquire) { *justInquire = true; }` 即返回，`proxy.cc:591-592`）。若需要 proxy，把 op 堆拷贝一份挂到 `plan->channels[c].proxyOpQueue`（`enqueue.cc:112-114`）。
+
+**阶段二：正式生产，kernel 发射之后，CUDA host 回调上下文。** kernel 发射时 NCCL 在 strong stream 上排了一个 `cudaLaunchHostFunc`（`enqueue.cc:1717`），其回调 `hostStreamPlanCallback`（`enqueue.cc:1452`）执行 `hostStreamPlanTask`（`enqueue.cc:1436`）：
+
+```c
+uploadProxyOps(comm, plan);   // enqueue.cc:1392 —— 重编号 opCount，正式 SaveOp
+ncclProxyStart(comm);         // proxy.cc:1014  —— 发布
+```
+
+`uploadProxyOps` 遍历 plan 的 op 队列，给每个 op 重编全局序号（**opCount 编码**：集合 op = `(comm->collOpCount<<1) + plan内序号`；p2p op = `(channel的p2pOpCount<<1) + 奇数序号`，最低位是 p2p 标记，`enqueue.cc:1407-1423`），然后调正式版 `ncclProxySaveOp(comm, op, nullptr)`（第三参为 NULL 表示"这次来真的"）。保存后恢复旧序号，供 persistent plan（graph 捕获重放）下次再用。opCount 是 5.4 节聚合的键。
+
+注意：`cudaLaunchHostFunc` 的回调跑在 **CUDA 驱动的内部工作线程**上，不是用户线程。这解释了生产端的一个设计选择——取不到空闲槽时**自旋 + `yield` 而不是条件变量睡眠**（见 5.2.4）：在 CUDA 回调线程里长时间阻塞会拖住 stream 上排队的后续回调。
+
+#### 5.2.2 `ncclProxySaveOp`：pattern 分解（`proxy.cc:602-766`）
+
+按 `op->pattern` 做 switch，为每个需要网络的方向各调一次 `SaveProxy`。以 ring 为例：
+
+```c
+case ncclPatternRing:
+  needProxy = NeedProxy(proxyRecv, ...);                 // ring 恒真；pipeline 链端 rank 不需要
+  if (needProxy) SaveProxy(comm, channel, proxyRecv, ring->prev, op, 0, justInquire);
+  needProxy = NeedProxy(proxySend, ...);
+  if (needProxy) SaveProxy(comm, channel, proxySend, ring->next, op, 0, justInquire);
+```
+
+即一次 ring allreduce 在该 channel 上产生**两条** op（一收一发）。全部 pattern 的拆分规则：
 
 | pattern | SaveProxy 调用 |
 |---|---|
@@ -311,16 +331,121 @@ ncclAllReduce
 | Send/Recv（p2p） | `root==comm->rank` 跳过；否则对 `root` 存一条（connIndex 1） |
 | Profiler | `SaveProxyProfiler`：op 指向 `comm->profiler.workStarted/workCompleted` 计数器 |
 
-**`SaveProxy`**（`proxy.cc:578-598`）：取 `channel->peers[peer]->send/recv[connIndex]` 连接器；`proxyConn.proxyProgress == NULL`（如 SHM）直接跳过——**不需要 progress 的 transport 根本不会进池**。
+#### 5.2.3 `SaveProxy`：连接器筛选（`proxy.cc:578-598`）
 
-**`ncclLocalOpAppend`**（`proxy.cc:489-555`）——生产者写入池的精确动作：
+```c
+struct ncclConnector* connector = type == proxyRecv ? peerComm->recv + connIndex : peerComm->send + connIndex;
+if (connector->proxyConn.proxyProgress == NULL) return ncclSuccess;   // 关键跳过
+if (justInquire) *justInquire = true;
+else { op->peer = peer; ncclLocalOpAppend(comm, &connector->proxyConn, op); }
+```
 
-1. 用 `proxyConn->tpLocalRank` 选中目标 proxy 的 `ncclProxyOps`（可能是自己的，也可能是 PXN 对端的池映射）；
-2. **取空闲槽**：优先用本地缓存 `proxyOps->freeOp`；耗尽则对 `pool->freeOps[本rank]` 做 `atomic_exchange(-1, acquire)` 取自旋等待（`std::this_thread::yield`，`proxy.cc:506-510`）——取到的是该 rank 独占段的链头；
-3. `memcpy` 整个 op 进槽，`op->next = -1`，补 `op->connection`，挂到本地未发布链 `proxyOps->nextOps` 尾；
-4. **满 `MAX_OPS_PER_PEER`(2048) 的截链保护**（`proxy.cc:526-552`）：提前发布一个前缀——但必须截在 **opCount 边界**（不回切最后一个 opCount 的 op），注释明确：同一 opCount 的 op 拆到不同批次会破坏 progress 线程按 opCount 聚合 subs。
+`proxyProgress == NULL` 的 transport（SHM、普通 P2P、NVLS）**根本不进池**——GPU 自己能完成，不需要 proxy。这一步把"哪些通信需要 proxy"的判定收敛到连接器的 vtable 上，pattern 分解代码无需关心 transport 细节。
 
-**`ncclProxyStart` / `ncclProxyPost`**（`proxy.cc:1014/477`）：对每个有待发 op 的 peer，持 `pool->mutex` 把本地链接到 `pool->nextOpsEnd`；若池空则置 `nextOps` 并 `cond.notify_one()` 唤醒 progress 线程；最后 `comm->opCount++`。
+#### 5.2.4 `ncclLocalOpAppend`：生产者本体（`proxy.cc:489-555`）逐段拆
+
+**目标池选择（`489-495`）**——两个 rank 索引别混淆：
+
+```c
+int tpLocalRank = comm->topParentLocalRanks[comm->localRank];   // 自己在本节点的 rank 号 → 槽位切片
+struct ncclProxyOps* proxyOps = comm->proxyState->proxyOps;
+proxyOps += proxyConn->tpLocalRank;                             // 连接对端的 proxy → 目标池
+struct ncclProxyOpsPool* pool = proxyOps->pool;
+```
+
+- **`proxyConn->tpLocalRank`** 选"**写给谁**"：这条连接的 proxy 在哪个 rank 上，就把 op 投进哪个池的映射（自己 rank 的池，或 PXN 场景本节点另一 rank 的池）；
+- **`tpLocalRank`（本地变量）** 选"**写到池里哪一段**"：自己在对方池里的独占切片 `[r*2048, (r+1)*2048)`。
+
+**取空闲槽——两级机制（`497-514`）**：
+
+```c
+int opIndex = proxyOps->freeOp;            // 一级：本地缓存（上次抢来的链的剩余）
+if (opIndex != -1) {
+  op = pool->ops + opIndex;
+  proxyOps->freeOp = op->next;             // 缓存链头后移，零原子操作
+} else {
+  int freeOp = -1;                         // 二级：缓存耗尽，去池里抢整条空闲链
+  while (freeOp == -1) {
+    freeOp = COMPILER_ATOMIC_EXCHANGE(&pool->freeOps[tpLocalRank], -1, acquire);
+    if (freeOp == -1) std::this_thread::yield();
+  }
+  opIndex = freeOp;
+  op = pool->ops + opIndex;
+  proxyOps->freeOp = op->next;             // 剩余挂进本地缓存
+}
+```
+
+- **一级缓存**：`proxyOps->freeOp` 是主线程私有的"上次 exchange 抢来的链的剩余"，大多数 op 从这里取，**完全无原子操作**；
+- **二级整链抢夺**：缓存耗尽时 `atomic_exchange(-1)` 把 `freeOps[tpLocalRank]` **整条链**抢走（池头置 -1），链头自用、余链入缓存。为 -1（消费者还没来得及还）就 `yield` 自旋——不睡眠，原因见 5.2.1（CUDA 回调线程）；
+- 这与消费端段 4 的 **CAS prepend 归还**（`proxy.cc:897-911`）正好互为对偶：生产者"整链拿走"，消费者"整链塞回"，在同一个 `volatile int` 上靠 acquire/release 原子指令并发，无需 mutex；
+- `if (op->next != -1) COMPILER_PREFETCH(...)`：预取缓存链的下一个槽位。
+
+**写槽（`516-519`）**：
+
+```c
+memcpy(op, proxyOp, sizeof(struct ncclProxyOp));   // 整个 op 拷进 SHM 槽位
+if (proxyOp->ringAlgo) proxyOp->ringAlgo->incRefCount();
+op->next = -1;
+op->connection = proxyConn->connection;            // 补上服务端连接句柄（建连 RPC 时拿到的）
+```
+
+此时槽位对消费端**尚不可见**——它还没挂到任何消费端能看到的链上。
+
+**挂本地未发布链（`520-525`）**：`proxyOps->nextOps` 是**主线程私有的未发布链**（不加锁，只有主线程碰）。op 先在这里攒着，等 `ncclProxyStart` 统一发布。
+
+**截链保护：满 2048 时提前发布前缀（`526-552`）**：
+
+```c
+if (++proxyOps->count == MAX_OPS_PER_PEER) {
+  uint64_t lastOpCount = pool->ops[proxyOps->nextOpsEnd].opCount;
+  // 从链头找"最后一个 opCount != 链尾 opCount 的 op"作为切割点
+  ...
+  if (lastOp == -1) { WARN(...); return ncclInternalError; }   // 全是同一 opCount，不能切
+  proxyOps->nextOps = pool->ops[lastOp].next;                  // 尾段留在本地继续攒
+  pool->ops[lastOp].next = -1;
+  ncclProxyPost(proxyOps->pool, nextOps, lastOp);              // 前缀立即发布
+  proxyOps->count -= toSend;
+}
+```
+
+本地链攒满 2048（`MAX_OPS_PER_PEER`）时，提前发布一个前缀腾槽位——但**切割点必须在 opCount 边界**。注释（`proxy.cc:527-529`）说得很直白：同一 opCount 的 op 拆到不同批次，会破坏消费端按 opCount 的 subs 聚合。这和消费端 `ncclProxyGetPostedOps` 按 `(peer, opCount)` 分组计数是同一约定的两端。
+
+#### 5.2.5 发布：`ncclProxyStart` → `ncclProxyPost`
+
+`ncclProxyStart`（`proxy.cc:1014-1030`）在一次 plan 的所有 op 都 append 完后调用：遍历每个 peer 的 `proxyOps`，有未发布链的调 `ncclProxyPost`，然后清空本地链和计数，`comm->opCount++`。
+
+`ncclProxyPost`（`proxy.cc:477-487`）是**生产端唯一持锁的地方**：
+
+```c
+std::lock_guard<std::mutex> lock(pool->mutex);
+if (pool->nextOps == -1) { pool->nextOps = nextOps; pool->cond.notify_one(); }
+else                     { pool->ops[pool->nextOpsEnd].next = nextOps; }
+pool->nextOpsEnd = nextOpsEnd;
+```
+
+- 临界区只做"接链尾 + 改尾指针"，O(1)；
+- **只在池从空变为非空时 `notify_one`**——这就是消费端情形 B 的唤醒来源；池非空时不唤醒是对的，因为消费端只有"彻底空闲"才会睡（它睡前在同一把锁内复查 `pool->nextOps == -1`，无丢失唤醒）。
+
+#### 5.2.6 生产端 vs 消费端的对称性
+
+| | 生产端（主线程/CUDA 回调线程） | 消费端（progress 线程） |
+|---|---|---|
+| 核心函数 | `ncclLocalOpAppend` + `ncclProxyPost` | `ncclProxyGetPostedOps` |
+| 空闲槽获取 | 本地缓存 `proxyOps->freeOp` → 耗尽 `atomic_exchange` 抢整链 | — |
+| 空闲槽归还 | — | 就地构建回收链，一次 CAS prepend 回 `freeOps[r]` |
+| 私有链 | 未发布链 `proxyOps->nextOps`（攒够再发） | 剩余链 `state->nextOps`（没消化完下轮续） |
+| 取不到/取完了怎么办 | `yield` 自旋（不能睡在 CUDA 回调线程） | `cond.wait` 睡眠（彻底空闲才睡） |
+| 锁的使用 | 仅发布时持 `mutex`，O(1) 临界区 | 仅摘链时持 `mutex`，O(1) 临界区 |
+| opCount 约定 | 满 2048 截链必须切在 opCount 边界 | 按 `(peer, opCount)` 分组限量，整组摄取聚合成 subs |
+| 批量哲学 | 批量抢槽（摊薄原子操作）、批量发布（摊薄锁+唤醒） | 批量摄取（16 组上限）、批量归还（一次 CAS 还一串） |
+
+#### 5.2.7 闭环验证：不丢、不重、不死锁
+
+- **不丢**：op 在"主线程私有链 → 池已发布链 → `state->nextOps` → active 链表"之间流转，每一步的所有权转移都是单点完成（私有链无并发、池链靠 mutex、`state->nextOps` 消费端私有），不存在"两边都以为对方持有"的状态。
+- **不重**：槽位在任一时刻只属于"空闲链 / 生产者缓存 / 未发布链 / 已发布链 / 正被转换"五种状态之一；回收（CAS）与再分配（exchange）在同地址原子操作上线性化。
+- **不死锁**：生产者只在发布时持锁（O(1)），消费者只在摘链时持锁（O(1)），取槽/还槽全部无锁；消费者睡眠只发生在无活跃 op 且池空时，且被"池空→非空"的 notify 精确唤醒。
+
+一句话总结：**`ncclLocalOpAppend` 负责"从自己的切片里取槽、写 op、攒成私有链"，`ncclProxyPost` 负责"把私有链一次性挂进池里并选择性唤醒消费者"**——生产端的一切设计（本地缓存、攒链、O(1) 临界区、边界截链）都是为了让主线程/CUDA 回调线程以最低延迟把 op 交出去，剩下的全交给 progress 线程。
 
 ### 5.3 消费：`ncclProxyGetPostedOps`（`proxy.cc:835-916`）逐段拆解
 
