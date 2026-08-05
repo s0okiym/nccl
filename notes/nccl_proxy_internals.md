@@ -322,19 +322,138 @@ ncclAllReduce
 
 **`ncclProxyStart` / `ncclProxyPost`**（`proxy.cc:1014/477`）：对每个有待发 op 的 peer，持 `pool->mutex` 把本地链接到 `pool->nextOpsEnd`；若池空则置 `nextOps` 并 `cond.notify_one()` 唤醒 progress 线程；最后 `comm->opCount++`。
 
-### 5.3 消费：`ncclProxyGetPostedOps`（`proxy.cc:835-916`）
+### 5.3 消费：`ncclProxyGetPostedOps`（`proxy.cc:835-916`）逐段拆解
+
+这是 progress 线程从 SHM 池摄取新 op 的**唯一入口**，也是 `ncclProxyOp`（池槽位消息）与 `ncclProxyArgs`（运行时实例）两种形态之间的"搬运工 + 回收站"。理解它的前提是 op 在池里的三条组织不变式（详见 1.5）：
+
+1. **槽位按生产 rank 切片**：rank r 独占 `ops[r*MAX_OPS_PER_PEER, (r+1)*MAX_OPS_PER_PEER)`，故 `opIndex / MAX_OPS_PER_PEER` 直接解码出生产者身份，无需任何元数据（`proxy.cc:876`）；
+2. **已发布链只有一条**：所有生产者的 op 经 `ncclProxyPost`（持 `mutex`）串到同一条 `pool->nextOps` 链，链内可混杂不同 rank、不同 opCount 的 op；
+3. **空闲链按 rank 分**：消费完的槽位必须归还到**原生产 rank** 的 `freeOps[i]`，否则切片布局被破坏。
+
+函数体分四段：
+
+#### 段 1：续处理检查（`proxy.cc:840`）
+
+```c
+if (state->nextOps != -1) goto process_nextops;
+```
+
+`state->nextOps`（progress 线程私有）是**上一轮批量处理没消化完的剩余链头**。若上轮因批量上限截断，本轮跳过一切加锁逻辑直接续跑——截断后续处理不碰 `mutex`。
+
+#### 段 2：取链——三种锁策略（`proxy.cc:845-861`）
+
+```c
+std::unique_lock<std::mutex> lock(pool->mutex, std::defer_lock);
+if (state->active != NULL && (pool->nextOps == -1 || !lock.try_lock()))
+  return ncclSuccess;                       // 情形 A
+
+if (state->active == NULL) {                // 情形 B
+  lock.lock();
+  if (pool->nextOps == -1 && !state->stop) {
+    ... ProxyCtrlSleep 事件 ...
+    pool->cond.wait(lock);                  // 全线程唯一睡眠点
+    ... ProxyCtrlWakeup 事件 ...
+  }
+}
+state->nextOps = pool->nextOps;             // 情形 C：摘下整条链
+pool->nextOps = pool->nextOpsEnd = -1;
+```
+
+| 情形 | 条件 | 行为 | 设计理由 |
+|---|---|---|---|
+| A | `active != NULL` 且（池空 **或** `try_lock` 失败） | 直接返回，一个 op 也不取 | 热路径优先：手里有活就干，绝不为取新 op 阻塞；`try_lock` 失败说明生产者正在发布，下轮再来 |
+| B | `active == NULL` 且池空 | `cond.wait` 睡眠 | 彻底空闲才允许睡眠，这是整条线程**唯一**的阻塞点（profiler 记 Sleep/Wakeup 事件） |
+| C | 拿到锁且池非空 | 整条链摘下，池头尾置 -1，解锁 | 批量转移所有权，持锁时间最短 |
+
+两个并发正确性要点：
+
+- **无丢失唤醒**：`cond.wait` 前在锁内复查 `pool->nextOps == -1`；生产者 `ncclProxyPost` 在同一把锁内"池空才 `notify_one`"（`proxy.cc:477-487`）——经典条件变量模式，不会睡死。
+- **情形 A 中无锁读 `pool->nextOps` 是良性竞争**：最坏结果是这轮漏取，下轮补上；它不参与睡眠判定，不影响唤醒正确性。
+
+#### 段 3：批量消费循环（`proxy.cc:867-895`）
+
+```c
+for (int opIndex = state->nextOps; opIndex != -1;) {
+  struct ncclProxyOp* peerOp = pool->ops + opIndex;
+  int peer = opIndex / MAX_OPS_PER_PEER;                    // 槽位索引 → 生产 rank
+  if ((lastOpCount && peerOp->opCount != lastOpCount) ||    // 组边界：opCount 变了
+      ((lastPeer != -1) && peer != lastPeer)) count++;      //         或 rank 变了
+  if (count == ncclParamProxyAppendBatchSize() + 1) break;  // 批量上限（默认 16 组）
+  lastOpCount = peerOp->opCount; lastPeer = peer;
+  if (peerOp->connection == NULL) return ncclInternalError; // 防御性检查
+  if (peerOp->next != -1) COMPILER_PREFETCH(pool->ops + peerOp->next);
+  NCCLCHECK(ProxyAppend(state, peerOp));                    // ★ 消息 → 运行时形态
+  (*added)++;
+  int lastOpIndex = opIndex;
+  opIndex = peerOp->next;
+  // 就地用 next 字段构建"待归还"链（倒挂到 freeOp[peer] 头上）
+  if (freeOp[peer] == -1) freeOpEnd[peer] = lastOpIndex;
+  else                    peerOp->next = freeOp[peer];
+  freeOp[peer] = lastOpIndex;
+  state->nextOps = opIndex;                                 // 每步更新续处理指针
+}
+```
+
+要点：
+
+- **批量上限按"组"计而不是按 op 个数计**：一组 = 同 rank 且同 opCount 的**连续** op 段，逻辑上就是"某 rank 某次集合通信的一批收发 op"。整组摄取保证 `ProxyAppend` 能完整地做 subs 聚合（见 5.4），不会把同一聚合单元切成两半。这正是生产者端 `ncclLocalOpAppend` 满 `MAX_OPS_PER_PEER` 时宁可提前截链发布、也必须在 opCount 边界截断（`proxy.cc:526-552`）的原因——两端约定一致。
+- **`break` 时不消费当前 op**：`state->nextOps` 在上一轮迭代末尾已指向它，剩余链原样留下轮（对应段 1 的 goto）。
+- **`COMPILER_PREFETCH`**：沿 `next` 索引预取下一个槽位，SHM 上指针追逐的标准优化。
+- **回收链是倒序就地构建的**：直接复用被消费槽位的 `next` 字段，把槽位串到本 peer 的私有链 `freeOp[peer]`（头）/ `freeOpEnd[peer]`（尾）上——零额外内存。
+- **`ProxyAppend` 是唯一的形态转换点**：转换完成后，`ncclProxyOp` 槽位就没有存在价值了，立即进入待回收链。
+
+#### 段 4：无锁归还（`proxy.cc:897-911`）
+
+```c
+for (int i = 0; i < proxyState->tpLocalnRanks; i++) {
+  if (freeOp[i] == -1) continue;
+  int oldFree = -1, newFree = freeOp[i];
+  oldFree = COMPILER_ATOMIC_LOAD(&pool->freeOps[i], acquire);
+  do {
+    pool->ops[freeOpEnd[i]].next = oldFree;       // 链尾接到当前空闲链头前
+  } while (!COMPILER_ATOMIC_COMPARE_EXCHANGE(&pool->freeOps[i], &oldFree, newFree,
+                                             /*success=*/release, /*failure=*/acquire));
+}
+```
+
+- 每个 rank 的回收链用**一次 CAS** 整体 prepend 回 `pool->freeOps[i]`——注意全程**不持 `mutex`**，槽位回收是无锁的。
+- CAS 失败说明有生产者并发地 `atomic_exchange(-1)` 抢走了空闲链（`ncclLocalOpAppend`，`proxy.cc:506-510`）：`oldFree` 被 CAS 自动更新为新值，重挂链尾重试，直到成功。
+- **内存序**：成功 release / 失败 acquire。`freeOpEnd[i].next = oldFree` 的写先于 release-CAS 发布，生产者 acquire-exchange 拿到链头后沿链读到的每个 `next` 都是已初始化的。
+- 归还后槽位重新进入生产者的可用集：生产者先消耗本地缓存 `proxyOps->freeOp`，耗尽才原子 exchange 抢整条空闲链（`proxy.cc:497-514`）——**生产者批量拿、消费者批量还**，原子操作频率都摊薄到 1/链长。
+
+#### 槽位流转闭环与两级空闲链
+
+一个槽位的一生：
 
 ```
-若 state->nextOps != -1（上次批量没处理完）→ 直接续处理
-加锁策略：
-  有活跃 op：仅在 (池非空 且 try_lock 成功) 时取，否则直接返回继续推进   ← 热路径不阻塞
-  无活跃 op：lock 后若池空且未 stop → cond.wait(lock)                    ← 唯一睡眠点
-              （profiler 记 ProxyCtrlSleep/Wakeup 事件）
-取链：state->nextOps = pool->nextOps; pool->nextOps = pool->nextOpsEnd = -1; 解锁
-批量处理（NCCL_PROXY_APPEND_BATCH_SIZE，默认 16，按"同 peer 同 opCount 连续段"计数组）：
-  每个 op → ProxyAppend(state, op)  → 挂入该 rank 的空闲回收链
-回收：对每个 rank 段，CAS 把回收链 prepend 回 pool->freeOps[i]（release/acquire 序，proxy.cc:897-911）
+[空闲] pool->freeOps[r] ──atomic_exchange──▶ 生产者本地缓存 proxyOps->freeOp
+[写入] 主线程 memcpy op 内容 + 填 connection → 挂本地未发布链 proxyOps->nextOps
+[发布] ncclProxyPost：持 mutex 接到 pool->nextOps（池空则 notify_one）
+[摄取] GetPostedOps：摘链 → 按 (peer,opCount) 分组批量处理
+[转换] ProxyAppend：ncclProxyOp ──拷贝──▶ ncclProxySubArgs（装入 ncclProxyArgs）
+        ├─ 同 shared 连接同 opCount → 聚合为 sub
+        ├─ 同连接新 opCount        → 挂 nextPeer
+        └─ 连接空闲                → 挂 state->active 尾
+[推进] progressOps 每轮调 args->progress()（如 sendProxyProgress 三阶段）
+[完成] state → ncclProxyOpNone → removeOp：
+        ├─ args 结构体 → 归还 state->pool 空闲链（堆上，allocateArgs 复用）
+        └─ ncclProxyOp 槽位 → 段 4 CAS 归还 pool->freeOps[r]
 ```
+
+注意这里有**两级独立的空闲链**，别混淆：
+
+- **op 槽位级**（SHM，`pool->freeOps[r]`）：本函数段 4 负责归还，生产者跨进程复用；
+- **args 实例级**（progress 线程堆内，`state->pool` + 分块的 `ncclProxyPool` 内存 bank，每块 `NCCL_MAX_OPS=2048` 个）：`allocateArgs`/`removeOp` 负责，纯线程内复用。
+
+#### 设计取舍小结
+
+1. **摘链式摄取**（锁内只做头指针交换）：持锁时间 O(1)，生产者几乎永远遇不到锁竞争，所以生产者发布可以无脑持锁。
+2. **有活不取、空才睡眠**：`active != NULL` 时 `try_lock` 失败即返——网络收发延迟以微秒计，为取新 op 阻塞哪怕一次都会反映到带宽上；彻底空闲时 `cond.wait` 避免烧 CPU。
+3. **按 (peer, opCount) 分组限量**：批量上限（`NCCL_PROXY_APPEND_BATCH_SIZE=16`）以逻辑聚合单元计，既限制单次摄取时延，又保证聚合完整性；配合主循环里的 `NCCL_PROGRESS_APPENDOP_FREQ=8` 节流（`proxy.cc:993`），小消息场景下摄取开销被压到最低。
+4. **槽位索引即元数据**：`opIndex / MAX_OPS_PER_PEER` 同时给出生产者身份和归还目的地，跨进程零额外协议。
+5. **回收无锁化**：归还是消费者侧唯一与生产者并发写的点，用 CAS 重试解决，不进 `mutex` 临界区。
+
+实际观察手段：profiler 插件里 `ProxyCtrlSleep/Wakeup/Append/AppendEnd` 四个事件正好对应段 2 和段 3 的边界；`NCCL_DEBUG=INFO NCCL_DEBUG_SUBSYS=PROXY` 能看到发布/摄取日志。
 
 ### 5.4 `ProxyAppend`：三级聚合结构（`proxy.cc:438-475`）
 
