@@ -27,7 +27,35 @@ doLaunches() ──> ncclLaunchKernel() ──> cuLaunchKernelEx()
 channel 选择可能不同，进而死锁。`finishPlan()` 把每 channel 的 work batch 轮转排入 kernel 参数区，并按
 `opCount` 合并各 channel 的 proxy-op 队列。
 
-## 2. 发射前的关键数据结构
+## 2. clique：进程内 communicator 的协调单元
+
+此处的 **clique** 不是 NVLink 拓扑或图论中的完全子图，而是同一个 NCCL 全局 communicator 中、位于**同一
+进程**的一组 local-rank `ncclComm`。初始化扫描 `peerInfo[]`：`hostHash` 与 `pidHash` 都相同的 rank 被归为一组；
+其中全局 rank 最小的 comm 成为 leader，所有成员的 `intraComm0` 都指向它，并记录 `intraRank`、`intraRanks`。
+leader 还以 `intraNext` 串起本地成员。因此 `intraComm0` 相等就是源码判断“属于同一 clique”的依据。
+
+```text
+同一个 8-rank communicator：
+  进程 P0: rank 0,1,2,3  → clique A, intraComm0 = comm(rank 0)
+  进程 P1: rank 4,5,6,7  → clique B, intraComm0 = comm(rank 4)
+```
+
+单进程单 GPU 时 clique 只有一个成员；`ncclCommInitAll` 或一个进程驱动多 GPU 时它才会有多个成员。它存在的原因是
+这些 comm 虽各自代表一个 rank，却必须协调共享的 host-side 状态和执行节奏：
+
+- `ncclGroupCommJoin()` 让同 clique 的成员在本次 group 链表中连续，`doLaunches()` 因而能先为全组 prepare、
+  再一轮轮地发射各成员的下一个 plan。
+- `NCCL_LAUNCH_MODE=GROUP` 下，成员在 leader 的 `intraBarrierCounter/intraBarrierGate` 上汇合。每轮以“是否仍有
+  未发射 plan”作为输入，barrier 返回总和；所有成员据此一致地继续或结束，避免本地 GPU 的 collective launch 节奏失配。
+- 同一 clique 不能混用 CUDA Graph capture 与非 capture；`doLaunches()` 在所有成员已经进入 barrier 前检查并拒绝这种
+  状态，避免无法成立的 stream/graph 依赖。
+- group 收尾时的 preconnect 以 clique 为边界处理，源码明确将其用于规避 split 后共享 communicator 的连接竞争；
+  finalize 也等待 clique 中全部成员到达后才清理 local resources。
+
+不要混淆两条链：`groupNext` 是某次 `ncclGroupStart/End` 中待处理 comm 的链，`intraNext` 是 clique 内成员链；
+前者刻意把后者的同组成员排在一起，后续 launch 才能按 clique 分段。
+
+## 3. 发射前的关键数据结构
 
 | 结构 | 作用 |
 | --- | --- |
@@ -39,7 +67,7 @@ channel 选择可能不同，进而死锁。`finishPlan()` 把每 channel 的 wo
 
 `ncclTestBudget()` 同时约束参数区和外部 work 空间。每个 plan 的 `kernelArgs` 至少包含 args 与 batch 描述；若全部 work 也能装下 `comm->workArgsBytes`（当前最多 4 KiB），`finishPlan()` 将其提升为 `Args`，避免额外内存访问。
 
-## 3. work 上传与 stream 编排
+## 4. work 上传与 stream 编排
 
 `ncclLaunchKernelBefore_NoUncapturedCuda()` 调用 `uploadWork()`。普通 work 有三种存储方式：
 
@@ -56,7 +84,7 @@ launch。
 在 graph capture 中 plan 标为 `persistent`。默认使用 capture-aware `deviceStream`；当
 `NCCL_GRAPH_STREAM_ORDERING=0`，kernel 改在 graph origin stream 发射，并以 external event wait 维持跨图顺序。
 
-## 4. CUDA kernel 如何真正发射
+## 5. CUDA kernel 如何真正发射
 
 `ncclLaunchKernel()` 由 `channelMask` 的 popcount 得到 grid.x（每个启用 channel 一个 block），以 plan 内
 任务所需的最大 `nWarps * 32` 得到 block.x，并选择动态 shared memory 大小。若同一 plan 内任务同质，
@@ -74,7 +102,7 @@ serialization，以及 CUDA 13/sm100 的 NVLink util-centric scheduling。
 压缩了本 batch 实际存在的 work；work 可从 parameter space（`ld.param`）或 FIFO/persistent global memory 读取。
 随后 kernel 沿 `nextJump` 执行该 channel 的后续 batch，并运行特化 `RunWorkBatch` 或通用 function-table entry。
 
-## 5. Proxy、完成与回收
+## 6. Proxy、完成与回收
 
 带 NET transport 的 plan 同时有 `proxyOpQueue`。常规模式下，CUDA launch 已提交后
 `ncclLaunchKernelAfter_NoCuda()` 立即在 host 调 `hostStreamPlanTask()`：它把 plan 内局部 `opCount` 平移为
@@ -91,7 +119,7 @@ communicator 全局序号，调用 `ncclProxySaveOp()`，再以 `ncclProxyStart(
 `persistentDestructor` 绑定到 CUDA graph，graph 销毁后才投递回收；这也会释放其 persistent work buffer 并递减引用计数。
 这两个路径避免了 GPU 或 graph 仍可能读取 metadata 时过早释放内存。
 
-## 6. 阅读与调试入口
+## 7. 阅读与调试入口
 
 - launch 主线：`src/group.cc:doLaunches` → `src/enqueue.cc:ncclLaunchPrepare` → `ncclLaunchKernel` → `ncclLaunchFinish`。
 - metadata：`finishPlan`、`uploadWork`、`src/include/device.h:ncclDevKernelArgs/ncclDevWorkBatch`。
