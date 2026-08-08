@@ -3,6 +3,7 @@
 > **文件**：`src/transport/net.cc`（约 2092 行）  
 > **角色**：NET 传输层宿主实现——把 **GPU kernel ↔ Proxy ↔ `ncclNet` 插件（IB/Socket 等）** 粘合起来  
 > **版本语境**：NCCL 2.30.x  
+> **小白入门（shared/设计动机）**：[`nccl_transport_net_cc_beginner_guide.md`](./nccl_transport_net_cc_beginner_guide.md)  
 > **相关笔记**：`nccl_proxy_internals.md`、`ncclIbIsend_analysis.md`、`nccl_ib_send_recv_cts_flow.md`、`nccl_net_ib_code_review.md`、`codex_nccl-chunking-pattern-head-tail-fifo-direct-registration.md`、`nccl_thread_model.md`
 
 ---
