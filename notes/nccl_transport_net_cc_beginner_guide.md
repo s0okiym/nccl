@@ -9,6 +9,7 @@
 
 ## 目录
 
+0. [术语先钉死：P2P 与 graph 是什么](#0-术语先钉死p2p-与-graph-是什么)
 1. [先忘掉代码：问题是什么](#1-先忘掉代码问题是什么)
 2. [net.cc 一句话 + 一张总图](#2-netcc-一句话--一张总图)
 3. [设计是如何一步步长出来的](#3-设计是如何一步步长出来的)
@@ -20,6 +21,58 @@
 9. [把整文件功能串起来](#9-把整文件功能串起来)
 10. [常见疑问](#10-常见疑问)
 11. [读完后建议的学习路径](#11-读完后建议的学习路径)
+
+---
+
+## 0. 术语先钉死：P2P 与 graph 是什么
+
+本文和 `net.cc` 里两个词最容易误解，先对齐含义。
+
+### 0.1 本文说的「P2P」是哪种？
+
+**是：走 NET 的 point-to-point（网络点对点）**——例如 `ncclSend` / `ncclRecv`，以及 AlltoAll 等基于 send/recv 的模式在**网卡路径**上的连接。
+
+**不是：本机 GPU↔GPU 的 NVLink/PCIe peer access。**
+
+| 说法 | 含义 | 典型代码 | 和 net.cc shared 的关系 |
+|------|------|----------|-------------------------|
+| **网络 P2P**（本文默认） | 跨节点（或走网）的 send/recv 边 | `TRANSPORT_NET`，常 `connIndex ≠ 0` | **shared 默认用在这类边上** |
+| **本机 GPU P2P** | 同机 GPU 直接访存 | `TRANSPORT_P2P`（`p2p.cc`），NVLink/PCIe | **不归 net.cc 的 shared 管** |
+
+> 一句话：beginner 文档里的 P2P = **NET 上的 point-to-point**，不是本机 GPU-to-GPU。
+
+### 0.2 「有 graph」指的是拓扑算出来的 graph 吗？
+
+**是的。** 这里的 `graph` 是 **`struct ncclTopoGraph*`**——初始化阶段由 **拓扑搜索** 得到的集体通信图（Ring / Tree / NVLS / CollNet…），**不是** CUDA Graph。
+
+来源关系：
+
+```text
+拓扑探测 (topo)
+  → 图搜索 (search/rings/trees…)
+  → 得到 ncclTopoGraph（如 graphs[NCCL_ALGO_RING]）
+  → ncclTransportP2pSetup(comm, graph, connIndex)
+  → selectTransport(..., graph, ...)
+  → net 的 sendSetup/recvSetup(comm, graph, ...)
+```
+
+在 `sendSetup` / `recvSetup` 里：
+
+```c
+shared = graph || connIndex == 0 ? 0 : /* 默认 P2P 用 shared */ 1;
+```
+
+| `graph` 指针 | 含义 | shared 倾向 |
+|--------------|------|-------------|
+| **非 NULL** | 正在为**某集体算法拓扑边**建 NET 连接（Ring/Tree 等跨节点边） | **强制非 shared**（专用缓冲） |
+| **NULL** | 不是“带着 topo graph 建 collective 边”，常见于 **send/recv 类网络 P2P 连接** | 再看 `connIndex` 等，**默认可 shared** |
+
+补充：
+
+- **`connIndex == 0`**：连接槽 0，集体路径常用主连接，也倾向 **非 shared**。  
+- **CUDA Graph**（捕获 kernel 图）是另一回事，和这里的 `ncclTopoGraph* graph` **无关**。
+
+> 一句话：代码里的 `graph` = **拓扑/算法算出来的 `ncclTopoGraph`**，有它 ⇒ 这条 NET 边是集体拓扑的一部分 ⇒ 不用 shared 缓冲池。
 
 ---
 
@@ -375,22 +428,28 @@ Proxy isend 时同样用 offset 取地址
 ```c
 shared = graph || connIndex == 0 ? 0
        : (NCCL_NET_SHARED_BUFFERS 若用户设了就用用户值)
-       : 1;   // 默认：P2P 用 shared
+       : 1;   // 默认：网络 P2P 用 shared
 ```
 
 翻译成人话：
 
 | 条件 | shared | 原因 |
 |------|--------|------|
-| 有 **graph**（集体 Ring/Tree 等拓扑边） | **0 非 shared** | 边少、流量大、要专用通道 |
-| **connIndex == 0** 的主连接（集体常用） | **0** | 同上 |
-| **P2P**（connIndex≠0 且无 graph） | **默认 1 shared** | 边多，省内存 |
+| **`graph != NULL`**（带着**拓扑算出的** `ncclTopoGraph` 建边，如 Ring/Tree 跨节点边） | **0 非 shared** | 集体拓扑边：边相对少、流量大、要专用通道 |
+| **`connIndex == 0`**（主连接槽，集体常用） | **0** | 同上 |
+| **网络 P2P**（`graph == NULL` 且 `connIndex != 0`，send/recv 类） | **默认 1 shared** | 边可能很多，省内存 |
 | 用户设 `NCCL_NET_SHARED_BUFFERS=0/1` | 强制 | 调优/调试 |
 
 ```text
-AllReduce 跨节点 ring 边  →  非 shared（专用大缓冲）
-ncclSend/Recv 很多 peer    →  shared（池化）
+AllReduce 跨节点 ring 边（有 topo graph）  →  非 shared（专用大缓冲）
+ncclSend/Recv 很多 peer（网络点对点）     →  shared（池化）
+本机 NVLink GPU peer（TRANSPORT_P2P）      →  不走 net.cc 这套 shared 逻辑
 ```
+
+再次强调：
+
+- 这里的 **P2P = 网络 point-to-point**，不是本机 GPU P2P。  
+- 这里的 **graph = `ncclTopoGraph`（拓扑/算法图）**，不是 CUDA Graph。
 
 ---
 
@@ -500,12 +559,12 @@ SHM 是另一种 transport。这里 shared 是 **NET 路径上的缓冲池共享
 
 ### Q2：非 shared 是不是更快？
 
-**集体 Ring/Tree 通常用非 shared，因为更稳、不抢池。**  
-P2P 边极多时 shared 往往 **整体更优**（省内存、缓存更友好）。不是绝对谁更快，是 **场景不同**。
+**集体 Ring/Tree（有 topo graph 的 NET 边）通常用非 shared，因为更稳、不抢池。**  
+**网络** P2P 边极多时 shared 往往 **整体更优**（省内存、缓存更友好）。不是绝对谁更快，是 **场景不同**。
 
 ### Q3：没有 shared 能不能跑 AlltoAll？
 
-能，但每条边一套缓冲可能 **OOM 或占满显存**。所以 P2P 默认 shared。
+能，但每条边一套缓冲可能 **OOM 或占满显存**。所以网络 P2P 默认 shared。
 
 ### Q4：和 `net_ib` 什么关系？
 
@@ -525,6 +584,16 @@ net_ib:  “isend 内部如何 ibv_post_send、QP、CTS”
 
 在 **延迟** 和 **占内存** 之间折中：太少流水线填不满网；太多浪费内存。8 是 NCCL 全局常数 `NCCL_STEPS`。
 
+### Q7：文档里的 P2P 是本机 GPU peer 还是网络点对点？
+
+**是网络点对点（NET 上的 send/recv 边），不是本机 GPU-to-GPU。**  
+本机 NVLink/PCIe peer 属于 `TRANSPORT_P2P`（`p2p.cc`），与 net.cc 的 shared 缓冲逻辑无关。详见 [§0.1](#01-本文说的p2p是哪种)。
+
+### Q8：`graph != NULL` 是不是拓扑算出来的 graph？是 CUDA Graph 吗？
+
+**是拓扑/算法图 `ncclTopoGraph*`（Ring/Tree/… 搜索结果），不是 CUDA Graph。**  
+初始化时 `ncclTransportP2pSetup(comm, graph, …)` 把该指针传进 `sendSetup`；有 graph 的 NET 边按**集体拓扑边**处理，强制非 shared。详见 [§0.2](#02-有-graph指的是拓扑算出来的-graph吗)。
+
 ---
 
 ## 11. 读完后建议的学习路径
@@ -542,9 +611,11 @@ net_ib:  “isend 内部如何 ibv_post_send、QP、CTS”
 | 概念 | 一句话 |
 |------|--------|
 | `net.cc` | GPU 与网卡插件之间的调度与缓冲管理层 |
-| 非 shared | 每条 NET 连接自备中转货位 |
-| shared buffers | 多条 P2P 连接租用同一货位池，用 offset 区分 |
+| 非 shared | 每条 NET 连接自备中转货位（集体 topo graph 边常用） |
+| shared buffers | 多条**网络 P2P** 连接租用同一货位池，用 offset 区分 |
 | shared comms | 多条流复用同一插件连接句柄 |
+| 本文 P2P | **NET 点对点**，不是本机 GPU peer |
+| graph 参数 | **`ncclTopoGraph`（拓扑算法图）**，不是 CUDA Graph |
 | head/tail | proxy 与 GPU 之间的环形信用账本 |
 | proxy progress | 快递员：看见货就 isend，到了就还货位 |
 | 插件 | 真正开货车的人 |
@@ -556,3 +627,4 @@ net_ib:  “isend 内部如何 ibv_post_send、QP、CTS”
 | 日期 | 内容 |
 |------|------|
 | 2026-07-10 | 初稿：面向小白的 net.cc 功能与设计演化；详细解释 shared/非 shared 与 shared buffers/comms 区别 |
+| 2026-07-10 | 增补 §0：明确 P2P=网络点对点（非本机 GPU peer）；graph=`ncclTopoGraph`（非 CUDA Graph）；FAQ Q7/Q8 |
