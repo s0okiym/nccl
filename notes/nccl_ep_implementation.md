@@ -8,6 +8,10 @@
 NCCL 仓库快照中的实现。要提交新 issue/PR 或判断更新版本行为，应同时检查新仓库，不能默认
 这里仍是唯一事实来源。
 
+文末第 19 节进一步对比了本地 `nccl-extensions` `main@aca70f9`。前 1–18 节仍以
+NCCL 仓内 `contrib/nccl_ep` 为基线；第 19 节专门说明迁移后已经变化的 API 和实现，
+避免把两个快照的行为混为一谈。
+
 ## 1. 先用一句话理解它
 
 MoE（Mixture of Experts，混合专家）层不会让每个 token 经过所有专家，而是由 router 为它挑选
@@ -409,6 +413,7 @@ launch。全部预编译会产生巨大二进制和编译时间，因此 `device
 
 `nccl_ep_env.cc` 在每次 `ncclEpCreateGroup` 时读取一次环境，之后 handle 使用 group 内缓存，
 运行中修改环境不会改变已有 group。布尔值只接受 `1/on/true` 或 `0/off/false`（不分大小写）。
+下表是 NCCL 仓内快照；扩展仓库已重命名并新增部分 HT 调优项，见 19.5 节。
 
 | 环境变量 | 当前作用 |
 |---|---|
@@ -541,6 +546,10 @@ prolog/epilog 和 preprocess 也默认用全部 SM。`NCCL_EP_COMM_SMS`、`NCCL_
 
 ## 17. 源码审阅发现的限制与易错点
 
+本节仅描述 NCCL 仓内快照。其中 HT 动态接收容量、量化和 ABI 扩展机制已在
+`nccl-extensions` 中改变，但 LL top-k 上限、`max_dispatch_tokens_per_rank` 不支持 AUTO 等
+限制仍然存在。
+
 1. **这是 v0.1 contrib API，且项目已迁移。** 它单独构建，公开 struct 做 size/magic 检查，
    许多参数错误使用 C/CUDA assert，可能直接终止进程；新开发发生在 `nccl-extensions`。
 2. **专家必须平均切分。** 代码用整数除法求 `num_local_experts`，应显式保证
@@ -582,7 +591,171 @@ prolog/epilog 和 preprocess 也默认用全部 SM。`NCCL_EP_COMM_SMS`、`NCCL_
    G2S/S2G/N2N warp、guard、Local Dup/Permute 和分层归并。
 8. `device/jit/jit_runtime.cc`：理解两种算法共用的缓存、nvcc、module 和 launch 属性。
 
-## 19. 总结
+## 19. 与 `nccl-extensions` main 的差异审核
+
+本节对比的两份源码是 NCCL 仓内 `contrib/nccl_ep/` 和独立仓库
+`/root/workspace/nccl-extensions/nccl_ep/` `aca70f984ff7`（2026-08-12）。后者的库版本号仍是
+0.1.0，但 `NCCL_EP_API_VERSION` 已从 1 升到 2；因此只看 `ncclEpGetVersion()` 返回的
+0.1.0 不足以判断功能集，还必须匹配公开头文件和实际 `libnccl_ep.so`。
+
+### 19.1 一张表看懂主要变化
+
+| 方面 | NCCL 仓内快照 | `nccl-extensions` main |
+|---|---|---|
+| 工程形态 | `contrib/nccl_ep`，依赖同树 NCCL build | 独立 `nccl_ep/`，默认依赖 `third_party/nccl` submodule，有 CMake 和 CI |
+| API/ABI | API v1，大多数 struct 要求精确 size | API v2，struct 按版本冻结前缀、只可在尾部追加 |
+| HT 接收容量 | 只有固定预算 | `max_recv_tokens_per_rank=AUTO` 支持 query-then-allocate eager 模式 |
+| HT 溢出 | 超预算 trap | 新增 TRAP/DROP 策略，DROP 可丢弃超预算 token 继续运行 |
+| dispatch 量化 | 由 token/scale 组合推断 INTERN/EXTERN | 由 `quant_recipe` 显式选择 NONE/QUANT_FWD/DS_FP8E3M4 |
+| combine 量化 | 无 | 新增实验性 LL NVFP4 通信 recipe |
+| zero-copy | AUTO 当作 OFF | AUTO/OFF 保留 staging，但遇到兼容 window 仍会机会性直连 |
+| HT pipeline | 编译时默认为主 | 可用 env 指定 stage/pipeline，并按 GPU shared-memory 上限自动收缩 |
+| Python | NCCL 仓内 EP binding 已删除 | `python/` 提供 `nccl-extensions` distribution，导入路径仍是 `nccl.ep` |
+| 测试 | 7 个主 suite，含 zero-copy/EM mode 重跑 | 12 个 suite，新增 ABI、量化、溢出、expert-id 和 elastic buffer 回归 |
+
+### 19.2 API v2 如何保持 ABI 兼容
+
+新头文件为每个公开 struct 定义 `*_V1_SIZE`、`*_V2_SIZE` 和 `*_CURRENT_VERSION`。
+`epValidateStruct` 只要求 `size >= V1_SIZE` 且 magic 正确；`epDecodeStruct` 先填当前默认值，再复制
+`min(caller_size, library_size)` 字节。效果是：
+
+- 旧 caller 没有的尾部字段自动取默认值。
+- 在采用这套 v2 兼容框架的后续库之间，新 caller 的未识别尾部可被忽略，不再因
+  `sizeof` 不同立即失败。这不会让旧 NCCL contrib v1 库反向具备前向兼容；它的精确
+  size 检查仍可能拒绝 v2 struct。
+- 每代尾部 padding 也显式占位，防止新字段偷用旧 ABI 的隐式 padding。
+- `group_config.version` 高于库所知版本时只在 verbose 下告警；是否可用新功能仍应先查
+  运行时版本和对应字段边界。
+
+v2 在 `ncclEpGroupConfig_t` 增加 `overflow_policy` 和 `num_topk`，在 dispatch/combine config
+增加 `quant_recipe`，并在 `ncclEpCombineInputs_t` 增加 `scales`。头文件还预留了数值 12
+作为 `ncclFloat4x2`，表示一字节装两个 FP4；它只用于 EP 字节搬运，不表示通用
+NCCL collective 已支持该 dtype。
+
+### 19.3 HT eager 容量与 overflow drop
+
+扩展仓库仍要求 `max_dispatch_tokens_per_rank > 0`；动态的是接收端容量，不是发送
+batch 上限。将 HT 的 `max_recv_tokens_per_rank` 设为 AUTO 后：
+
+1. group 内部仍按 `R * max_dispatch * num_topk`（未设 `num_topk` 时因子为 1）预留最坏工作区。
+2. `UpdateHandle` 的 scan 把当前路由的实际接收数写入 `recv_total_counter`；Expert Major
+   返回含 alignment padding 的槽位总数。
+3. caller 将该标量 D2H 并同步，再按该数分配 dispatch outputs。Expert Major eager 必须在
+   group 配置 `num_topk`，否则库无法估算最坏展开槽位。
+
+eager 不能 capture `ncclEpDispatch`，也不能与 DROP 策略并用；独立测试程序已用
+`ep_test -q` 演示可工作的 query-then-allocate。`ep_bench --dynamic-tokens` 试图让
+`max_dispatch_tokens_per_rank=AUTO`，仍会被明确拒绝。
+
+固定接收预算时，AUTO overflow 解析为 TRAP。设为 `NCCL_EP_OVERFLOW_DROP` 后，scan 将超过
+预算的映射写成无效槽位并把实际执行 count 夹到 capacity，dispatch/combine 可继续；
+`recv_total_counter` 则保留 drop 之前的真实总数，便于框架统计过载。这是语义性丢 token，
+不是无损的自动扩容。
+
+### 19.4 从 INTERN/EXTERN 转向显式量化 recipe
+
+新实现不再仅根据 dtype 和 scales 是否存在推断模式，而是在 config 中明确指定：
+
+- `NCCL_EP_DISP_QUANT_NONE`：BF16/FP16/FP32 原样通信，输入和输出 scales 都必须缺席。
+- `NCCL_EP_DISP_QUANT_FWD`：LL/HT 都可用，只转发调用者已生成的 token 和 scale 物理字节，
+  不做数值转换。token 可为 FP32/FP16/BF16/E4M3/E5M2/`Float4x2`；scale 可为
+  FP32/FP16/BF16/E4M3/E5M2/`ncclUint8`。输入输出 dtype 和行宽必须对应相同，
+  token/scale 行和 base/window offset 都要
+  16-byte 对齐。HT 的 token 与 scale 输出必须同时使用 window 或同时不使用。
+- `NCCL_EP_DISP_QUANT_DS_FP8E3M4`：LL-only，将 BF16 内部量化为 E4M3，每 128 元素生成
+  一个 FP32 scale；hidden 必须是 512 的倍数。这大体对应旧 INTERN 思路。
+- `NCCL_EP_COMB_QUANT_NVFP4`：实验性 LL-only combine。caller 仍提供 BF16 expert 输出和每行
+  FP32 global scale，kernel 使用 E2M1 FP4 打包通信后解量化。它需要 CUDA 12.9+ 的
+  `cuda_fp4.h` 和支持 FP4 的 device target；HT 和普通 FP8 combine 仍不支持。
+
+`max_token_bytes` 在新代码中是“物理 token 行 + scale 行”的合计预算，HT 还要求其为
+16 的倍数。这与只按未量化 hidden 乘元素大小设置的旧用法不完全等价。
+
+### 19.5 zero-copy、HT Expert Major 和 pipeline 的改动
+
+扩展仓库里 AUTO 和 OFF 的意思都是“保留库内 staging 作为 fallback”，不是禁止直连；
+只要 caller 传入兼容的外部 NCCL window，仍会机会性走 direct path。ON 才是强契约：
+
+- LL 仍只能在纯 NVLink/LSA 的 Rank Major dispatch 直写，但 QUANT_FWD 的 token 和 scale
+  window 可独立命中；ON 要求至少一个 eligible payload 有 window。LL combine 仍是 staging。
+- HT ON 仍要求 dispatch token output 和 combine token input 使用 window；QUANT_FWD dispatch 的
+  token/scale outputs 必须 both-or-neither。AUTO/OFF 下默认的 Expert Major Local Permute 即使
+  收到 window 也会先走 Flat staging，再由 permute kernel 写用户窗口，所以不是端到端直写。
+- HT 的 Local Permute 和 Local Dup 已改成按字节行搬运，并可跟随 QUANT_FWD 同时
+  fan-out/permute scale 行，旧快照中“这两路径固定 16 位、拒绝 FP8”的结论已过期。
+
+Expert Major 自动选择 Nvlink Dup 的条件也从易混淆的 LSA team size 改为
+`是否存在多个 LSA team`（代码中用 `rdma_team_size > 1`）：多 team 选 Nvlink Dup，
+单 team 选 Local Dup；非 ON 默认仍是 Local Permute。HT 还为 GIN resource-sharing guard
+预留 context 0，所以 AUTO QP 数变为“1 个保留 context + comm SM 对应的 N2N contexts”。
+
+文件和命名也做了系统整理：`hybrid_ep.cuh`/`hybridep_adapter.cu` 改为
+`ht_ep.cuh`/`ht_ep_adapter.cu`，`NCCL_EP_PROLOG_EPILOG_SMS` 改为 `NCCL_EP_SHUFFLE_SMS`。
+新增的 HT 调优项是：
+
+| 环境变量 | 作用 |
+|---|---|
+| `NCCL_EP_DISPATCH_NUM_STAGES` | dispatch 总 stage 数 |
+| `NCCL_EP_DISPATCH_NUM_PIPELINES` | dispatch pipeline 数 |
+| `NCCL_EP_COMBINE_NUM_STAGES_G2S` | combine global-to-shared stage 数 |
+| `NCCL_EP_COMBINE_NUM_STAGES_S2G` | combine shared-to-global stage 数 |
+| `NCCL_EP_COMBINE_NUM_PIPELINES` | combine pipeline 数 |
+
+adapter 根据 token 宽度、layout、pipeline 和 GPU 的 opt-in shared-memory 上限计算实际占用。
+未被 env 锁定的 stage/pipeline 可自动减小到可运行组合；用户显式锁定的值不会被悄悄
+修改，无法装入时返回 `ncclInvalidArgument`。`NCCL_EP_ENV_VERBOSE=1` 会打印请求值、解析值和
+shared-memory 成本。LL dispatch/combine 仍 JIT，但 clean kernel 已改回在
+`ll_ep_adapter.cu` 中预编译，不再使用旧 `ll_clean_jit.cuh`。
+
+### 19.6 elastic buffer、Python 与测试工程
+
+`examples/nccl_ep_elastic_buffer.h` 是新增的参考 allocator，用 CUDA VMM 把少量 GPU 物理内存
+和大量 `HOST_NUMA` 内存映射成一段连续 VA，让常见 token 落在 GPU 段，尖峰负载溢到
+CPU 段。它不是新 EP API，当前只建议用于 HT Expert Major + Local Permute + 普通
+pointer 的 recv tensor：FLAT fallback 的 `cudaMemcpy` 不能驱动 HOST_NUMA VMM 段，window-backed
+zero-copy 还缺 system-scope fence，LL 也尚未把 mixed GIN segment 路径接入。
+
+新仓库根目录的 `python/` 定义了名为 `nccl-extensions` 的 distribution，依赖 `nccl4py`，
+但只向共享 `nccl` namespace 添加 `nccl.ep`、`nccl.m2n` 和内部 binding。从源码可这样安装：
+
+```bash
+cd /root/workspace/nccl-extensions
+git submodule update --init --recursive
+make -C nccl_ep nccl-submodule
+make -C nccl_ep MPI=1
+CUDA_HOME=/usr/local/cuda pip install -e 'python/[cu13]'
+```
+
+可分发 wheel 还需把 `libnccl_ep.so` 和 JIT headers 放到 `python/nccl/ep/` 约定目录；
+否则 editable install 会告警，运行时必须通过外部库搜索路径与 `NCCL_EP_HOME`/`NCCL_HOME`
+提供兼容的库和 JIT 头文件。
+
+新测试列表加入 `test_public_struct_abi`、`test_ht_overflow_drop`、
+`test_quantization_recipe`、`test_recv_topk_idx_flags` 和 `test_elastic_buffer`，共 12 个主 suite；
+受 Expert Major 影响的 suite 仍会在 Local Dup/Nvlink Dup 下重跑。`ci/` 另外提供 Slurm
+入口，单机测试仍不依赖 MPI。
+
+### 19.7 对扩展仓库文档和包装层的审核结论
+
+迁移后代码发展很快，当前仍有几处不能盲信文字说明：
+
+1. `RELEASE.md` 仍写“没有内部量化”，与已实现的 LL DS_FP8E3M4 和 NVFP4 矛盾。
+2. EP README 的 GroupConfig 示例仍把 HT `max_recv_tokens_per_rank` 写成必须正数，但同文档
+   后面和实现已支持 AUTO eager。“AUTO 不支持”只对 `max_dispatch_tokens_per_rank` 仍然成立。
+3. EP README 的 Python quick start 说 `pip install nccl4py[cu13]` 会包含 EP，而本仓库实际
+   `pyproject.toml` 把它定义为单独的 `nccl-extensions` distribution；nccl4py 是它的依赖。
+4. Python `GroupConfig` docstring 仍说 max-recv AUTO 不支持、zero-copy AUTO 等于 OFF；高层
+   `CombineConfig` 也尚未暴露 NVFP4 `quant_recipe`。生成的低层 Cython 声明仍使用旧
+   `quantization_recipe` 命名和 API version 1 初始值，虽然当前 struct 布局/数值仍能对上，
+   但不应假设 Python facade 已覆盖所有 v2 功能。
+5. C 头文件中 `ncclEpHandleMemSize/InitHandle/UpdateHandle` 的重复声明仍然存在；只是过期
+   `num_topk=-1` 注释已修正。
+
+因此，面向新集成应以 `nccl-extensions/nccl_ep/include/nccl_ep.h` 和 `nccl_ep.cc` 为语义基准，
+用新 tests 验证目标 layout/recipe/window 组合；旧 NCCL contrib 快照适合用来理解架构，
+不应再作为新功能的 API 依据。
+
+## 20. 总结
 
 NCCL EP 的本质是一个“懂 MoE 路由的双向数据交换引擎”。LL 以更直接的 peer/RDMA 通路和
 双缓冲换取小 batch 低延迟；HT 先把 top-k 编译成映射，再用节点内聚合、跨节点 GIN 和
