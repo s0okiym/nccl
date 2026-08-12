@@ -2,7 +2,7 @@
 
 > 分析对象：本仓库 `nccl/`（NCCL v2.29.7 分支）当前代码。本文聚焦 `ncclFuncAllReduce` 的设备端实现，以及从 `ncclLaunchKernel` 发射 kernel 到本地 kernel 返回之间的执行、同步和 proxy 协作流程。
 >
-> 本文是 [`codex_nccl-user-thread-enqueue-plan-kernel.md`](./codex_nccl-user-thread-enqueue-plan-kernel.md) 的下篇：上篇说明“用户线程 enqueue → plan → kernel launch”，本文从 `ncclLaunchKernel` 接续，说明 Classic/Symmetric 两套 kernel 如何执行 AllReduce，以及它们如何与 GPU memory、transport 和 proxy 协同。
+> 本文是 [`user-thread-enqueue-kernel-flow.md`](user-thread-enqueue-kernel-flow.md) 的下篇：上篇说明“用户线程 enqueue → plan → kernel launch”，本文从 `ncclLaunchKernel` 接续，说明 Classic/Symmetric 两套 kernel 如何执行 AllReduce，以及它们如何与 GPU memory、transport 和 proxy 协同。
 >
 > 文中的源码位置优先使用文件和函数/符号名；行号会随 NCCL 版本变化，不能替代源码本身。除非特别说明，本文描述的是当前工作区代码，而不是所有历史版本的统一行为。
 
@@ -452,4 +452,4 @@ Symmetric 在 legacy algorithm selection 之前先尝试从任务队列中筛选
 4. **执行与同步**：RSxLD/Multimem 或 AGxLL variant 直接处理对称内存，使用 LSA barrier 或 LL A2A session；`ncclCoopCta` 只表示 CTA 级协作。
 5. **完成**：Symmetric kernel 完成后由本地 launch stream 观察；其没有 Classic proxy 生命周期，但内部 barrier/mailbox 必须完成相应的 peer-memory 可见性。
 
-理解 §2 的算法步骤、§4.4 的 head/tail 双向协议、§4.6 的 proxy control-plane，以及 §5 的 Symmetric 分流，就能准确解释 AllReduce 在 NCCL 中“kernel 启动后到底发生了什么”。协议与 primitive 的通用细节见 [`codex_nccl-protocols-primitives-algo-selection-kernel-launch.md`](./codex_nccl-protocols-primitives-algo-selection-kernel-launch.md)，kernel、proxy、FIFO 和 plan 的不同完成边界见 [`codex_nccl-m18-completion-reclaim-m21-profiling-observability.md`](./codex_nccl-m18-completion-reclaim-m21-profiling-observability.md)。
+理解 §2 的算法步骤、§4.4 的 head/tail 双向协议、§4.6 的 proxy control-plane，以及 §5 的 Symmetric 分流，就能准确解释 AllReduce 在 NCCL 中“kernel 启动后到底发生了什么”。协议与 primitive 的通用细节见 [`protocols-primitives-kernel-launch.md`](protocols-primitives-kernel-launch.md)，kernel、proxy、FIFO 和 plan 的不同完成边界见 [`completion-reclaim-profiling.md`](completion-reclaim-profiling.md)。

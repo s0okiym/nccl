@@ -1,7 +1,7 @@
 # NCCL Kernel Launch 生命周期：准备、发射与收尾（v2.30.7）
 
 > 本文聚焦普通 NCCL device kernel 的 launch 路径；任务如何选算法、划 channel 与创建
-> `ncclDevWork*` 的前半段见 [nccl_enqueue_pipeline.md](nccl_enqueue_pipeline.md)。源码入口主要是
+> `ncclDevWork*` 的前半段见 [enqueue-kernel-pipeline.md](enqueue-kernel-pipeline.md)。源码入口主要是
 > `src/group.cc`、`src/enqueue.cc`、`src/include/{comm,device,strongstream}.h` 和 `src/device/common.h`。
 
 ## 1. 全景：一个 group 如何变成多个 CUDA kernel

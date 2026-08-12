@@ -335,7 +335,7 @@ ncclGinInitCommon(gin, comm, contextIndex):
 
 - `contrib/nccl_ep`（扩展插件，in/outbox、kernel fusion）、`nccl_m2n`、`nccl_ubx`、`nccl_checkpoint`。
 - Device API 示例：`docs/examples/06_device_api/02_alltoall_gin`、`docs/examples/07_kernel_fusion/03_rmsnorm_gin`。
-- RMA/symmetric memory 路径（参见 `notes/rma_vs_gin.md` 与 `docs/contrib/GIN/NCCL_Gin_and_Symmetric_Memory/`）。
+- RMA/symmetric memory 路径（参见 `rma-vs-gin.md` 与 `docs/contrib/GIN/NCCL_Gin_and_Symmetric_Memory/`）。
 
 ### 9.3 与 RMA 的关系
 
@@ -382,5 +382,5 @@ GIN Proxy **在底层调用 RMA plugin**（`ncclRmaIbProxy` 的 `iput/iputSignal
 
 - `plugins/gin/README.md`（自定义 GIN 实现指南：概念、host/device API、版本兼容）。
 - `docs/contrib/GIN/NCCL_Gin_and_Symmetric_Memory/NCCL_Gin_and_Symmetric_Memory.md`。
-- `notes/rma_vs_gin.md`（RMA 与 GIN 对比、容易混淆的点）。
+- `rma-vs-gin.md`（RMA 与 GIN 对比、容易混淆的点）。
 - `docs/dev_guide/nccl_internals.md` §10（GIN 三层使能条件总览）。

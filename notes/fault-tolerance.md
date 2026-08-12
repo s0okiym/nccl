@@ -4,7 +4,7 @@
 > **范围**：应用级 API 恢复、设备/代理中止、IB 传输弹性、RAS 诊断；**不含** 框架级 checkpoint/restart  
 > **相关代码**：`src/init.cc`、`src/group.cc`、`src/device/primitives.h`、`src/transport/net_ib/p2p_resiliency*.cc`、`src/ras/`  
 > **官方文档**：`docs/userguide/source/usage/communicators.rst`（Fault Tolerance / Error handling）  
-> **相关笔记**：`nccl_thread_model.md`、`ibv_post_send_ms_stall_analysis.md`、`nccl_params.md`
+> **相关笔记**：`thread-model.md`、`ibv-post-send-stall.md`、`env-params.md`
 
 ---
 

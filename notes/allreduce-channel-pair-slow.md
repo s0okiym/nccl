@@ -6,7 +6,7 @@
 > 且慢的 channel 总是 **`c` 与 `c+nChannels/2`（即 `c+8`）成对出现**。
 >
 > 本文记录问题背景、代码层结论、日志解读、诊断地图与根因候选。
-> 配套可读：[`allreduce-training-slow-analysis.md`](./allreduce-training-slow-analysis.md)
+> 配套可读：[`allreduce-training-slow-debug.md`](allreduce-training-slow-debug.md)
 > 与 [`docs/dev_guide/nccl_internals_indepth.md`](../docs/dev_guide/nccl_internals_indepth.md)。
 
 ---

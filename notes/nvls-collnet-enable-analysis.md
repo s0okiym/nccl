@@ -3,7 +3,7 @@
 > **状态**：基于 NCCL 源码与 HGX 类拓扑的归纳  
 > **目标机型**：8× NVIDIA H200（NV18）+ 8× 400G RoCE（mlx5 / eth400g）+ 双 NUMA  
 > **相关代码**：`src/init.cc`、`src/transport/nvls.cc`、`src/transport/coll_net.cc`、`src/graph/tuning.cc`、`src/graph/search.cc`、`src/graph/connect.cc`、`src/device/all_reduce.h`、`src/include/coll_net.h`  
-> **相关笔记**：`nccl_params.md`、`nccl_thread_model.md`、`ibv_post_send_ms_stall_analysis.md`、`allreduce-channel-c8-pair-slow-analysis.md`
+> **相关笔记**：`env-params.md`、`thread-model.md`、`ibv-post-send-stall.md`、`allreduce-channel-pair-slow.md`
 
 ---
 
@@ -474,7 +474,7 @@ COLLNET_ENABLE 生效:
 
 ## 10. 与 `ibv_post_send` / 训练性能的关系
 
-详见 `ibv_post_send_ms_stall_analysis.md`。与本开关交叉结论：
+详见 `ibv-post-send-stall.md`。与本开关交叉结论：
 
 | 设置变化 | 对 `ibv_post_send` 的影响 |
 |----------|---------------------------|
@@ -1066,7 +1066,7 @@ export NCCL_IB_ROCE_VERSION_NUM=2
 6. **单机**：CollNet 恒关；NVLS 1/0 决定多播 vs Ring/Tree@NVLink。  
 7. **多机纯 RoCE 无插件/无 SHARP**：CollNet 1/0 无实质差别；NVLS 影响机内与 NVLS_TREE，机间仍是 400G NET。  
 8. **多机 + 插件 + SHARP（或等价）**：CollNet 1/0 有机间路径质变；可与 NVLS 组合（机内 NVLS + 机间 CollNet）。  
-9. 两个开关 **不能替代** 对 NET 路径（`ibv_post_send`、NIC 亲和、平台抖动）的分析；见 `ibv_post_send_ms_stall_analysis.md`。
+9. 两个开关 **不能替代** 对 NET 路径（`ibv_post_send`、NIC 亲和、平台抖动）的分析；见 `ibv-post-send-stall.md`。
 
 ```text
 总结一张图:
@@ -1111,14 +1111,14 @@ export NCCL_IB_ROCE_VERSION_NUM=2
 | CollNet 传输与 proxy | `src/transport/coll_net.cc`：`ncclCollNetSetup`、`sendProxyProgress`、`collNetIallreduce` |
 | AllReduce NVLS kernel | `src/device/all_reduce.h`：`NCCL_ALGO_NVLS` |
 | AllReduce CollNet Direct kernel | `src/device/all_reduce.h`：`NCCL_ALGO_COLLNET_DIRECT` |
-| 参数表 | `notes/nccl_params.md` |
+| 参数表 | `env-params.md` |
 
 ## 附录 B：与其它笔记的关系
 
 | 笔记 | 关系 |
 |------|------|
-| `ibv_post_send_ms_stall_analysis.md` | 机间 NET 门铃尖峰；NVLS/CollNet 不能直接当根因或银弹 |
-| `nccl_thread_model.md` | CollNet / NET 走 proxy；NVLS 正常路径无 proxy progress |
-| `ncclIbIsend_analysis.md` | NET 数据面 isend 链路（与 CollNet `iallreduce` 对照） |
-| `allreduce-channel-c8-pair-slow-analysis.md` | 含 NVLS 多播可用时的案例观察 |
-| `nccl_ib_send_recv_cts_flow.md` | 普通 NET CTS 流程（CollNet 不走此路径） |
+| `ibv-post-send-stall.md` | 机间 NET 门铃尖峰；NVLS/CollNet 不能直接当根因或银弹 |
+| `thread-model.md` | CollNet / NET 走 proxy；NVLS 正常路径无 proxy progress |
+| `ib-isend-analysis.md` | NET 数据面 isend 链路（与 CollNet `iallreduce` 对照） |
+| `allreduce-channel-pair-slow.md` | 含 NVLS 多播可用时的案例观察 |
+| `ib-send-recv-cts.md` | 普通 NET CTS 流程（CollNet 不走此路径） |

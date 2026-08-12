@@ -1,7 +1,7 @@
 # NCCL Proxy 子系统与 Progress 线程完全解析（v2.30.7）
 
 > 本文逐行基于 `src/proxy.cc`（2151 行）、`src/include/proxy.h`（469 行）及 `src/enqueue.cc`、`src/transport/net.cc` 相关段落整理，所有结论附 `文件:行号`。
-> 前置阅读：`notes/nccl_thread_model.md`（线程全景）。
+> 前置阅读：`thread-model.md`（线程全景）。
 
 ---
 

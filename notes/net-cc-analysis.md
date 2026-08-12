@@ -3,8 +3,8 @@
 > **文件**：`src/transport/net.cc`（约 2092 行）  
 > **角色**：NET 传输层宿主实现——把 **GPU kernel ↔ Proxy ↔ `ncclNet` 插件（IB/Socket 等）** 粘合起来  
 > **版本语境**：NCCL 2.30.x  
-> **小白入门（shared/设计动机）**：[`nccl_transport_net_cc_beginner_guide.md`](./nccl_transport_net_cc_beginner_guide.md)  
-> **相关笔记**：`nccl_proxy_internals.md`、`ncclIbIsend_analysis.md`、`nccl_ib_send_recv_cts_flow.md`、`nccl_net_ib_code_review.md`、`codex_nccl-chunking-pattern-head-tail-fifo-direct-registration.md`、`nccl_thread_model.md`
+> **小白入门（shared/设计动机）**：[`net-cc-beginner-guide.md`](net-cc-beginner-guide.md)  
+> **相关笔记**：`proxy-internals.md`、`ib-isend-analysis.md`、`ib-send-recv-cts.md`、`net-ib-code-review.md`、`chunking-pattern-fifo-registration.md`、`thread-model.md`
 
 ---
 
@@ -591,7 +591,7 @@ irecv(recvComm, subCount, ptrs, sizes, tags, mhandles, phandles, &request)
 
 推进 tail/head 相关计数，使 GPU 原语看到数据；完成后累计 `args->done`。
 
-（细节与 profiler 埋点见源码 1610–1765 行；与 `nccl_proxy_internals.md` §5.6 一致。）
+（细节与 profiler 埋点见源码 1610–1765 行；与 `proxy-internals.md` §5.6 一致。）
 
 ---
 
@@ -735,8 +735,8 @@ Rank1 proxy 线程 isend 出 mlx5（靠近 Rank1 的 NIC）
 | **`net.cc`** | 调用插件，不感知 IB QP 细节 |
 | **`coll_net.cc`** | 平行的集合 offload 适配层 |
 | **`proxy.cc`** | 调度 `proxyProgress`、RPC 状态机 |
-| **`nccl_proxy_internals.md`** | Proxy 框架总览；本文是 NET 适配详解 |
-| **`ibv_post_send_ms_stall_analysis.md`** | 故障常落在插件 isend 内部；计时应区分 net.cc 与 ibv |
+| **`proxy-internals.md`** | Proxy 框架总览；本文是 NET 适配详解 |
+| **`ibv-post-send-stall.md`** | 故障常落在插件 isend 内部；计时应区分 net.cc 与 ibv |
 | **注册 / FIFO 专题** | `codex_nccl-chunking-pattern-...md` |
 
 **调试拆分：**
@@ -824,4 +824,4 @@ export NCCL_DEBUG_SUBSYS=INIT,NET,PROXY,REG
 | 调试与不变量 | 有（§21） |
 | 行号索引便于跳转 | 有（§22） |
 
-讲解按 **生命周期顺序** 组织，进度状态机单独成章，并与现有 `nccl_proxy_internals.md` 互补（proxy 框架 vs NET 适配细节）。
+讲解按 **生命周期顺序** 组织，进度状态机单独成章，并与现有 `proxy-internals.md` 互补（proxy 框架 vs NET 适配细节）。

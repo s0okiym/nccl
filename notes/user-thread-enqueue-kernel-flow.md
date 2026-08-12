@@ -443,7 +443,7 @@ retain:                      [24, 24]
 
 `ProxyAppend()` 才是第二级、执行态聚合：以 `connection->proxyAppendPtr` 定位 append lane；仅当 connection 标记为 shared 且当前 args 的 `opCount` 相同时，才把新描述符转换成另一个 `ncclProxySubArgs` 并追加到同一个 `ncclProxyArgs`。转换还会校验 `sliceSteps`、`chunkSteps`、protocol、datatype、reduction op 和 collective 类型一致，且 args 必须仍处于 `ncclProxyOpReady`。不满足聚合条件时，新建 args 并通过 `nextPeer` 保持该 lane 的执行顺序。
 
-共享池里的 `ncclProxyOp` 只承担跨提交边界的描述符传递：转换完成后，槽位立即按原生产者分区组成回收链并通过 atomic CAS 放回 `freeOps[]`；实际异步状态已经转移到 `ncclProxyArgs/subs[]`，直到 transport progress 完成后由 `removeOp()` 回收。由此要区分三个生命周期：plan 描述符由 `reclaimPlan()` 回收，共享 pool 槽位在 append 成 args 后即可复用，运行中的 transport 状态则独立持续到 proxy completion。更完整的完成与回收关系见 `codex_nccl-m18-completion-reclaim-m21-profiling-observability.md`。
+共享池里的 `ncclProxyOp` 只承担跨提交边界的描述符传递：转换完成后，槽位立即按原生产者分区组成回收链并通过 atomic CAS 放回 `freeOps[]`；实际异步状态已经转移到 `ncclProxyArgs/subs[]`，直到 transport progress 完成后由 `removeOp()` 回收。由此要区分三个生命周期：plan 描述符由 `reclaimPlan()` 回收，共享 pool 槽位在 append 成 args 后即可复用，运行中的 transport 状态则独立持续到 proxy completion。更完整的完成与回收关系见 `completion-reclaim-profiling.md`。
 
 #### 7.3.6 `NCCL_PROXY_CPUSET`：为 Proxy 线程指定 CPU 集合
 

@@ -3,7 +3,7 @@
 > 状态：分析结论（含计时方法论纠偏）  
 > 场景：分布式训练中，`src/transport/net_ib/p2p.cc` 的 `ncclIbMultiSend` / `wrap_ibv_post_send` 出现数 ms～数十 ms 尖峰  
 > 相关代码路径：`ncclIbIsend` → `ncclIbMultiSend` → `wrap_ibv_post_send` → `ibv_post_send`  
-> 相关既有笔记：`ncclIbIsend_analysis.md`、`nccl_ib_send_recv_cts_flow.md`
+> 相关既有笔记：`ib-isend-analysis.md`、`ib-send-recv-cts.md`
 
 ---
 
@@ -124,7 +124,7 @@ export NCCL_IB_ROCE_VERSION_NUM=2
 | 等完成 | `ncclIbTest` / `ibv_poll_cq` |
 | IB 重传 | timeout/retry，体现在完成延迟 |
 
-详见 `nccl_ib_send_recv_cts_flow.md`、`ncclIbIsend_analysis.md`。
+详见 `ib-send-recv-cts.md`、`ib-isend-analysis.md`。
 
 ---
 
@@ -399,5 +399,5 @@ static inline ncclResult_t wrap_ibv_post_send(...) {
 ## 11. 参考
 
 - 源码：`src/transport/net_ib/p2p.cc`、`src/include/ibvwrap.h`、`src/transport/net.cc`、`src/debug.cc`
-- 笔记：`notes/ncclIbIsend_analysis.md`、`notes/nccl_ib_send_recv_cts_flow.md`、`notes/nccl_params.md`
+- 笔记：`ib-isend-analysis.md`、`ib-send-recv-cts.md`、`env-params.md`
 - NVIDIA status `0x00000056`：`NV_ERR_NOT_SUPPORTED`

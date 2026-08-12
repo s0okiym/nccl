@@ -2,8 +2,8 @@
 
 > **面向读者**：不熟悉 NCCL 内部的读者；先建立直觉，再对照代码。  
 > **对应源码**：`src/transport/net.cc`  
-> **进阶文档**：[`nccl_transport_net_cc_analysis.md`](./nccl_transport_net_cc_analysis.md)（偏源码结构）  
-> **相关**：`nccl_proxy_internals.md`、`ncclIbIsend_analysis.md`
+> **进阶文档**：[`net-cc-analysis.md`](net-cc-analysis.md)（偏源码结构）  
+> **相关**：`proxy-internals.md`、`ib-isend-analysis.md`
 
 ---
 
@@ -601,8 +601,8 @@ net_ib:  “isend 内部如何 ibv_post_send、QP、CTS”
 1. **本文**建立直觉：流水线、head/tail、shared/非 shared  
 2. 看一次发送日志：有没有 `/Shared`  
 3. 读 `sendProxyProgress` 三个 `if`（posted / transmitted / done），对照 §4 快递比喻  
-4. 再读 [`nccl_transport_net_cc_analysis.md`](./nccl_transport_net_cc_analysis.md) 的函数表  
-5. 若关心 IB：再读 `ncclIbIsend_analysis.md`  
+4. 再读 [`net-cc-analysis.md`](net-cc-analysis.md) 的函数表  
+5. 若关心 IB：再读 `ib-isend-analysis.md`  
 
 ---
 

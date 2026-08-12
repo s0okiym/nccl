@@ -1,7 +1,7 @@
 # NCCL Enqueue 全流程解析：从用户调用到 kernel 发射（v2.30.7）
 
 > 本文逐行基于 `src/collectives.cc`、`src/enqueue.cc`（3246 行）、`src/group.cc`、`src/include/comm.h`、`src/include/info.h` 整理，所有结论附 `文件:行号`。
-> 前置阅读：`notes/nccl_thread_model.md`（线程模型）、`notes/nccl_proxy_internals.md`（proxy 机制）、`notes/nccl_cuda_stream.md`（stream 语义）。
+> 前置阅读：`thread-model.md`（线程模型）、`proxy-internals.md`（proxy 机制）、`cuda-stream.md`（stream 语义）。
 
 ---
 
@@ -306,7 +306,7 @@ do {
 
 1. profiler group/task 事件；
 2. `uploadProxyOps`（`enqueue.cc:1392`）：重编号 opCount（最低位 p2p 标记；集合 `(collOpCount<<1)+id`、p2p `(p2pOpCount[channel]<<1)+id`）→ 正式 `ncclProxySaveOp` → 恢复旧编号（persistent 重放要用）；
-3. `ncclProxyStart`——proxy op 进 SHM 池（详见 `notes/nccl_proxy_internals.md` §5.2）；
+3. `ncclProxyStart`——proxy op 进 SHM 池（详见 `proxy-internals.md` §5.2）；
 4. 非 persistent plan：把 `plan->reclaimer` 挂到 `comm->callbackQueue`，主线程下次进 group 时 `reclaimPlan`（`enqueue.cc:1462`）回收 plan/proxyOp/work 内存到各自 pool；persistent plan 由 graph 析构回调 `persistentDestructor`（`enqueue.cc:1528`）统一回收。
 
 ---
