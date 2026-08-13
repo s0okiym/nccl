@@ -15,6 +15,9 @@
 4. [阶段展开：主线程建连 `P2pSetup`](#4-阶段展开主线程建连-p2psetup)
 5. [RPC 是什么：Init / Setup / Connect](#5-rpc-是什么init--setup--connect)
 6. [稳态：几乎只剩 Progress](#6-稳态几乎只剩-progress)
+6.1. [Progress 入门：args / sub / 三个计数器](#61-progress-入门args--sub--三个计数器)
+6.2. [`sendProxyProgress` 逐步流程](#62-sendproxyprogress-逐步流程)
+6.3. [`recvProxyProgress` 逐步流程](#63-recvproxyprogress-逐步流程)
 7. [注册、销毁、例外](#7-注册销毁例外)
 8. [关键注意事项](#8-关键注意事项)
 9. [重要数据结构表](#9-重要数据结构表)
@@ -234,15 +237,237 @@ proxy 服务线程
 | **GPU** | 写/读货位，改 tail、`connFifo.size`（不在 net.cc） |
 | **Proxy 进度** | **`sendProxyProgress` / `recvProxyProgress`** → 插件 isend/irecv/test |
 
-**`sendProxyProgress` 三步（每个切片）：**
+**`sendProxyProgress` 三步（每个切片）：** posted → isend → test。  
+**`recvProxyProgress` 五段：** 分组 → irecv → test → flush → 通知 GPU → 等 GPU 还 credit。  
 
-1. **posted**：给 GPU 放 credit（shared 还要写池子 offset）  
-2. **transmitted**：看到 size/tail（LL 还要扫 flag）→ `isend`  
-3. **done**：`test` 完成 → **先 `size=-1` 再更新 head**
+下面把两个函数按「小白能跟着走完一遍」写细。源码约 `net.cc:1324` / `1493`。
 
-**`recvProxyProgress`：** 按同一 `recvComm` 分组 → `irecv` → `test` → GDR 时 flush → 通知 GPU。
+### 6.1 Progress 入门：args / sub / 三个计数器
 
-Progress 内部还可能：`sharedBuffersGet`、`setXferNetAttrs`。
+每次集体或 send/recv，enqueue 会给 **这条 NET 边**（或一组边）挂一个 `ncclProxyArgs`：
+
+| 字段 | 白话 |
+|------|------|
+| `args->nsubs` | 这次要推进几条「子流」（常 = 几条连接/channel） |
+| `args->subs[s]` | 第 s 条子流 |
+| `args->protocol` | LL / LL128 / SIMPLE |
+| `args->sliceSteps` / `chunkSteps` | 一次推进多少「步」（切片粒度） |
+| `args->state` | Ready → Progress → None |
+| `args->idle` | 本轮有没有干成活；0=有进展 |
+| `args->done` | 已完成的 sub 个数 |
+
+每个 **sub** 像一条流水线上的计数器：
+
+```text
+0  ≤  done  ≤  transmitted  ≤  posted  ≤  nsteps
+
+posted      ：已经「安排」到第几步（send：给 GPU 放了多少空位；recv：发了多少 irecv）
+transmitted ：已经交给网络 / 已经让 GPU 看见的步数
+done        ：网络和 GPU 都收工、可以忘掉的步数
+nsteps      ：这次 op 总共多少步
+base        ：本 op 在这条连接上的步号起点（接上一次的 resources->step）
+```
+
+货位下标：`buffSlot = (base + 当前步) % NCCL_STEPS`（一般 8 个槽转圈）。
+
+**谁调用：** proxy **进度线程**循环 `progressOps` → `args->progress(args)`，即这两个函数。  
+**一次调用通常只推进一步**：有进展就 `idle=0` 并 `continue`/`return`，下次再来，避免饿死别的 op。
+
+---
+
+### 6.2 `sendProxyProgress` 逐步流程
+
+角色：本端 GPU 已（或将要）把数据放进货位，**proxy 负责发出去**。
+
+#### Ready（每个 op 只做一次）
+
+对每个 sub：
+
+```text
+base = 把连接上的 step 上对齐到 chunkSteps
+resources->step = base + nsteps     // 给下一次 op 接着编号
+posted = transmitted = done = 0
+若不是用户缓冲注册：sendMhandle = 协议缓冲的 MR
+state = Progress
+```
+
+#### Progress：对每个还没 `done==nsteps` 的 sub，按顺序尝试三件事
+
+**（1）posted：给 GPU 空货位**
+
+条件：`posted < nsteps` 且 `posted < done + maxDepth`  
+`maxDepth = min(8, 16/nsubs)`，防止一次占满所有槽。
+
+- **非 shared**：只把 `posted += sliceSteps`（专用货位地址 GPU 早就知道）。  
+- **shared**：  
+  1. `sharedBuffersGet` 算出池子里的 **offset**；  
+  2. 写入 `connFifo[slot].offset`，fence；  
+  3. `posted += sliceSteps`；  
+  4. **立刻** `head = base + posted - NCCL_STEPS`（放行 GPU 去写这块）。  
+- GDRCopy：写 `gdcSync` 再 `wc_store_fence`。  
+- 然后 **`continue`**（本轮这个 sub 先做到这）。
+
+**（2）transmitted：货齐了就 `isend`**
+
+条件：`transmitted < posted`（GPU 已被允许写到这）且未超出 8 槽。
+
+「货齐了」要同时：
+
+- `connFifo[slot].size != -1`（GPU 写下了字节数）  
+- `recvMem->tail > 当前步`（GPU 发布了；**LL 协议**可放宽，靠线内 flag）  
+
+数据地址：
+
+| 模式 | `buff` 从哪来 |
+|------|----------------|
+| 非 shared 普通 | `localBuff + slot * stepSize` |
+| shared 普通 | `localBuff + connFifo.offset` |
+| shared + 用户注册 | `sendbuff + transmitted * NCCL_MAX_NET_SIZE` |
+| 非 shared + 注册 | `ringAlgo->getNextSendAddr`（须和 fifo size 一致） |
+
+还要 **ready**：
+
+- **LL128 + 非 GDR**：扫每一行末尾 flag 是否等于 `step+1`（GPU 只 threadfence，proxy 必须自己确认写完）。  
+- **LL**：扫每行 `flag1/flag2`。  
+- **SIMPLE + GDR**：一般 `size`+`tail` 就够。
+
+ready 后：
+
+```text
+setXferNetAttrs（本次 op 的并发 hint，每轮最多一次）
+ncclNet->isend(netSendComm, buff, size, tpRank, mhandle, phandle, &request[slot])
+request 非空 → 插件收下了 → transmitted += sliceSteps → continue
+request 为空 → 插件暂时吃不下，下次再试（不报错）
+```
+
+**（3）done：`test` 完成，还货位**
+
+条件：`done < transmitted`（网上还有没完成的 isend）。
+
+```text
+ncclNet->test(request[slot], &done, &size)
+若完成:
+  connFifo[slot].size = -1
+  fence                         // 必须先于 head
+  非 shared: head = base + done // 让 GPU 复用该槽
+  shared: 不在这里改 head（信用在 posted 已发）
+  done += sliceSteps
+  若 done==nsteps: args->done++，丢掉 ringAlgo
+```
+
+全部 sub 完成 → `args->state = None`，这个 proxy op 从进度队列消失。
+
+#### 发送侧和 GPU 对账（再看一眼）
+
+```text
+GPU:  等 head 有空位 → 写 buff → size=N → tail++
+Proxy: posted 放空位 → 看见 size/tail → isend → test → size=-1 → head++
+```
+
+---
+
+### 6.3 `recvProxyProgress` 逐步流程
+
+角色：proxy **先向网卡收数据**，收齐并保证 GPU 可见后，再让 GPU 读。
+
+比 send 多两步：要 **分组 multi-recv**，GDR 还要 **flush**。
+
+#### Ready：按 `recvComm` 分组
+
+插件一次 `irecv` 可以收多路（`maxRecvs`）。Ready 时把 **同一个 `netRecvComm`** 的 sub 换到一起，设 `groupSize`。
+
+每个 sub 同样设 `base/step`，并清 `posted/received/transmitted/done`，`regBufferReady=0`。
+
+之后循环按 **组** 走（`s += groupSize`）。
+
+#### （1）posted：组好地址，发 `irecv`
+
+组内每个还没 post 满的 sub，在不超过 `maxDepth` 时，填一组数组：
+
+| 模式 | 收数据写到哪 |
+|------|----------------|
+| SIMPLE 专用 | `localBuff + slot*stepSize`，长度 `stepSize*sliceSteps` |
+| SIMPLE 共享 | 池子 offset，写入 `connFifo.offset` |
+| SIMPLE + 用户注册 | **先等 kernel 启动**：`connFifo[base%8].size==-1` 才 `regBufferReady`，再直收用户 `recvbuff` |
+| LL / LL128 | 协议 FIFO 槽 |
+
+然后对整组：
+
+```text
+可选：LL/LL128 且只有 1 路 → OPTIONAL_RECV_COMPLETION（少一次严格 completion）
+ncclNet->irecv(recvComm, subCount, ptrs, sizes, tags, mhandles, phandles, &request)
+成功（request 非空）→ 组内每个 sub posted += sliceSteps
+```
+
+本轮若刚 irecv 成功（`idle==0`），**先 return**，下次再 test。
+
+#### （2）received：`test` 这组 irecv 是否完成
+
+`posted > received` 时 `test(request)`。
+
+完成则：
+
+- 每个 sub：`connFifo[slot].size = -1`，`received += sliceSteps`  
+- 若 SIMPLE 且 GDR 且 `needFlush` 且本次真有数据 → **做 flush**  
+
+**Flush 为什么要：** NIC 经 PCIe 写 GPU 是 posted write，CPU 看见 CQE 不代表 GPU 已看见数据。
+
+- 有 `gdcFlush`：x86 上 `mfence` + 读一下 GPU 映射地址，卡住直到写落盘。  
+- 否则 `ncclNet->iflush`（常见是一次 RDMA Read 当刷）。  
+
+flush 发起后也 `idle=0` 先 return。
+
+#### （3）transmitted：通知 GPU「可以读了」
+
+`received > transmitted`：若刚才的 flush request 也 test 完（或没有 flush）：
+
+```text
+fence
+recvTail（或 gdcSync）= base + transmitted
+transmitted += sliceSteps
+```
+
+GPU 原语看到 tail 前进，才去读货位。
+
+#### （4）done：等 GPU 读完，还网络 credit
+
+GPU 读完会推进 **`sendMem->head`**（接收侧这条 conn 上，head 表示消费进度）。
+
+proxy：
+
+```text
+读 sendHead
+while (GPU 已消费超过 done) 且 (不超过 transmitted):
+  可选 irecvConsumed（告诉插件这组 multi-recv 已被消费）
+  done += sliceSteps
+  若 done==nsteps: args->done++
+```
+
+全部 sub 完成 → `state = None`。
+
+#### 接收侧和 GPU 对账
+
+```text
+Proxy: irecv 到货位 → test 到 → flush → 推 tail
+GPU:   看见 tail → 读数据 → 推 head
+Proxy: 看见 head → done++，必要时 irecvConsumed
+```
+
+---
+
+### 6.4 两个 Progress 对照（帮助记忆）
+
+| | **sendProxyProgress** | **recvProxyProgress** |
+|--|----------------------|------------------------|
+| 谁先动 | GPU 先写 | Proxy 先 irecv |
+| 步数名 | posted / transmitted / done | posted / **received** / transmitted / done |
+| 网络 API | `isend` → `test` | `irecv` → `test` → 可选 `iflush`/`irecvConsumed` |
+| 分组 | 每个 sub 独立 | **同 recvComm 合成一组** multi-recv |
+| 放行 GPU | posted（shared）或 done（专用）更新 **head** | transmitted 更新 **tail** |
+| 等 GPU | transmitted 等 size+tail | done 等 GPU 的 **head** |
+| 用户缓冲 | isend 直接用 sendbuff / ringAlgo | irecv **前必须等 kernel 启动** |
+
+Progress 里还可能调用：`sharedBuffersGet`、`setXferNetAttrs`。
 
 ---
 
