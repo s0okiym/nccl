@@ -13,6 +13,14 @@
 2. [术语（务必先读）](#2-术语务必先读)
 3. [完整时间线：从 init 到销毁](#3-完整时间线从-init-到销毁)
 4. [阶段展开：主线程建连 `P2pSetup`](#4-阶段展开主线程建连-p2psetup)
+4.1. [建连总览：一条 NET 边要过几道门](#41-建连总览一条-net-边要过几道门)
+4.2. [`sendSetup` 逐步流程](#42-sendsetup-逐步流程)
+4.3. [`recvSetup` 逐步流程](#43-recvsetup-逐步流程)
+4.4. [`sendProxySetup` / `recvProxySetup`](#44-sendproxysetup--recvproxysetup)
+4.5. [Bootstrap 交换 connectInfo](#45-bootstrap-交换-connectinfo)
+4.6. [`sendConnect` 逐步流程](#46-sendconnect-逐步流程)
+4.7. [`recvConnect` 逐步流程](#47-recvconnect-逐步流程)
+4.8. [`sendProxyConnect` / `recvProxyConnect`](#48-sendproxyconnect--recvproxyconnect)
 5. [RPC 是什么：Init / Setup / Connect](#5-rpc-是什么init--setup--connect)
 6. [稳态：几乎只剩 Progress](#6-稳态几乎只剩-progress)
 6.1. [Progress 入门：args / sub / 三个计数器](#61-progress-入门args--sub--三个计数器)
@@ -140,64 +148,247 @@ shared = graph || connIndex == 0 ? 0 : /* 默认网络 P2P */ 1;
 源码：`src/transport.cc` `ncclTransportP2pSetup`。  
 **线程：主线程。** bootstrap 此时 **已经可用**。
 
-对每个要对齐的 peer、每个置位的 channel：
+下面把 **建连核心函数** 按「一条跨节点发送边 + 对端接收边」走完。进度函数见 §6。
 
-### ① 选传输 + Setup
-
-```text
-selectTransport
-  按 P2P → SHM → NET → COLLNET 顺序 canConnect
-  同机常被 P2P/SHM 抢走，走不到 NET
-  跨节点: canConnect 成功
-    → sendSetup 或 recvSetup
-```
-
-**`canConnect`**：默认允许 NET；同机再问拓扑是否禁用节点内 NET。
-
-**`sendSetup`（主线程自己）**
-
-1. 定 `shared`（见术语）。  
-2. `ncclTopoGetNetDev`：网卡 + **谁当 proxy**（PXN 可能是旁边 GPU）。  
-3. GDR？置 `NCCL_DIRECT_NIC`。  
-4. `ncclProxyConnect`：连上该 proxy（内部先 **RPC Init**，登记一条 NET 发送 connection）。  
-5. **`ncclProxyCallBlocking(ncclProxyMsgSetup, setupReq)`** → proxy 上 **`sendProxySetup`**。  
-6. 写 `connectInfo`：proxyRank + useGdr，供对端。
-
-**`sendProxySetup`（proxy，被 RPC 调用）**  
-calloc `sendNetResources`，抄 req，`getProperties`（DMA-BUF、maxRecvs…）。  
-**不 listen、不 connect 网卡、不分配数据大缓冲。**
-
-**`recvSetup` / `recvProxySetup`**  
-对称；proxy 上 **`listen`**，响应带回 **`ncclNetHandle_t`**。Recv **不做 PXN**（proxy 必须是本 rank）。
-
-### ② Bootstrap 交换
-
-主线程 **不进** net.cc，用 bootstrap 把双方 `connectInfo` 对调。  
-发送侧给出 proxyRank+useGdr；接收侧给出 listen handle。
-
-### ③ Connect（可异步多圈 poll）
+### 4.1 建连总览：一条 NET 边要过几道门
 
 ```text
-transportComm->connect == sendConnect / recvConnect
-  内部: populateCommNetAttrs
-        ProxyCallAsync(Connect)
-        Poll 直到成功
-        必要时 netMapShm / import IPC
-        填 conn.head/tail/buffs
-        挂 proxyProgress
-成功则 cudaMemcpy conn → GPU
+① canConnect          这条边能不能走 NET
+② sendSetup           发送 rank 主线程：决策 + RPC Init + RPC Setup
+   └ sendProxySetup   发送 proxy：建 sendNetResources 空壳
+③ recvSetup           接收 rank 主线程：决策 + RPC Init + RPC Setup
+   └ recvProxySetup   接收 proxy：listen，返回 handle
+④ bootstrapSend/Recv  两端主线程交换 connectInfo（handle / proxyRank / useGdr）
+⑤ sendConnect         发送主线程：RPC Connect（可多次 poll）
+   └ sendProxyConnect 发送 proxy：插件 connect + 分配货位 + regMr
+⑥ recvConnect         接收主线程：RPC Connect
+   └ recvProxyConnect 接收 proxy：插件 accept + 货位 + regMr
+⑦ cudaMemcpy conn → GPU
+⑧ 再一条 bootstrap 栅栏，清 connect mask
 ```
 
-**`sendProxyConnect` / `recvProxyConnect`（proxy）**  
-插件 `connect`/`accept`；按 shared 分配货位；`regMr`；把 `connectMap` 传回主线程。  
-`netSendComm==NULL` 时返回 InProgress，主线程再 poll。
+同机常被 `TRANSPORT_P2P`/`SHM` 的 `canConnect` 抢走，**整段 NET 建连都不会发生**。
 
-**`populateCommNetAttrs`**：按集体/网络 P2P 填插件并发 hint。  
-**`netMapShm`**：PXN 时主线程导入 proxy 的 HOST 映射。
+---
 
-### ④ 再一条 bootstrap 栅栏，清 mask
+### 4.2 `sendSetup` 逐步流程
 
-然后这条 NET 边对主线程来说 **建完了**。
+**谁调：** `selectTransport` 选中 NET 之后，主线程立刻调。  
+**还不连网卡。** 只「想清楚 + 通知本侧 proxy 开户」。
+
+**（1）定 shared**
+
+```c
+shared = graph || connIndex == 0 ? 0 : 默认 1;
+```
+
+集体 topo 边 / 槽 0 → 专用货位；网络 send/recv 边 → 默认可共享池。
+
+**（2）选网卡和谁当快递员（proxy）**
+
+```c
+ncclTopoGetNetDev(..., peerRank, &netDev, &proxyRank);
+```
+
+- `netDev`：插件里的网卡号。  
+- `proxyRank`：由哪个 rank 的 proxy 出网。  
+  - 等于自己：本 GPU 的 proxy 发。  
+  - **不等于自己 = PXN**：旁边更靠近 NIC 的 GPU 的 proxy 发。  
+- 集体主连接且 PXN → `comm->useNetPXN = true`。
+
+**（3）GDR**
+
+```c
+ncclTopoCheckGdr(..., isSend=1, &useGdr);
+if (useGdr) flags |= NCCL_DIRECT_NIC;
+```
+
+NIC 能否直接 DMA GPU。集体主连接若不能，会把 comm 级 `useGdr` 关掉。
+
+**（4）挂上 proxy 电话：`ncclProxyConnect(NET, send=1, proxyRank)`**
+
+内部（`proxy.cc`）：
+
+1. 算 `sameProcess`（同机同 pid？）。  
+2. 没有到该 proxy 的 socket → 连上。  
+3. **RPC Init**（`ncclProxyMsgInit`）：proxy 上登记「这是一条 NET **发送** connection」，返回 `connection*` cookie。  
+4. 若该传输有 Progress，打开共享 ops 池。  
+
+**（5）填 `setupReq` 并发 RPC Setup**
+
+字段：shared、netDev、useGdr、channel、connIndex、本端/远端 top-parent rank、`sameDevice`（kernel 的 GPU 和 **发包那个 proxy 所在 GPU** 是否同一块）。
+
+```c
+ncclProxyCallBlocking(..., ncclProxyMsgSetup, &req, sizeof(req), NULL, 0);
+```
+
+无响应体。等到 `sendProxySetup` 做完才返回。
+
+**（6）写 `connectInfo` 给对端**
+
+- 开头：`topParentRanks[proxyRank]`（对端要知道是谁连过来；PXN 时不是数据 GPU 自己）。  
+- 偏移 `sizeof(ncclNetHandle_t)`：`useGdr`。  
+
+发送 Setup **没有** listen handle；那一块先拿来塞 proxyRank。
+
+打日志：`Channel xx : me -> peer [send] via NET/IB/dev /GDRDMA /Shared (proxyRank)`。
+
+---
+
+### 4.3 `recvSetup` 逐步流程
+
+和 send **不对称** 的几点：
+
+| | sendSetup | recvSetup |
+|--|-----------|-----------|
+| 选网卡的 peer | **对端 rank**（为发出去选路） | **自己**（接收用本机 NIC） |
+| proxyRank | 可以是别人（PXN） | **必须本 rank**（「We don't support PXN on receive」） |
+| 额外 | — | GDR 时算 `needFlush` |
+| RPC Setup 响应 | 无 | **`ncclNetHandle_t`**（listen 句柄） |
+
+流程：同样定 shared → 选本端网卡/GDR/flush → `ProxyConnect(NET, send=0, **myRank**)` → Blocking Setup，响应写进 `connectInfo` 前部 → 再附 useGdr。
+
+对端 send 后面用这个 handle 去 `connect`。
+
+---
+
+### 4.4 `sendProxySetup` / `recvProxySetup`
+
+都在 **proxy 服务线程**，被 `proxyProgressAsync` 看到 `ncclProxyMsgSetup` 后调用。
+
+**`sendProxySetup`**
+
+1. 检查 `reqSize`。  
+2. `calloc sendNetResources`，挂 `connection->transportResources`。  
+3. 把 req 全部抄进 resources。  
+4. `ncclNet->getProperties(netDev)`：DMA-BUF？`maxRecvs`？device-net 类型？`maxP2pBytes` 是否合法？  
+5. **到此结束。** 不 listen、不 connect、不分配数据大缓冲。  
+6. `*done=1`，connection 标 `connSetupDone`。
+
+**`recvProxySetup`**
+
+前几步相同，然后：
+
+```c
+ncclNet->listen(netDev, respBuff, &netListenComm);
+```
+
+`respBuff` 就是主线程拿到的 **handle**。listen 句柄留在 `resources->netListenComm`，等 Connect 时 `accept`。
+
+---
+
+### 4.5 Bootstrap 交换 connectInfo
+
+仍在 `ncclTransportP2pSetup` 主线程，**不进 net.cc**：
+
+```text
+Rank A sendSetup 写出:  [proxyRank | .... | useGdr_A]
+Rank B recvSetup 写出:  [listen handle........ | useGdr_B]
+        bootstrapSend/Recv 对调
+Rank A 之后 sendConnect 读到: B 的 handle + useGdr_B
+Rank B 之后 recvConnect 读到: A 的 proxyRank + useGdr_A
+```
+
+同一 peer 的多个 channel 的 `ncclConnect` 打成一包交换。
+
+---
+
+### 4.6 `sendConnect` 逐步流程
+
+**谁调：** `P2pSetup` 在 bootstrap 交换之后，对 `connected==0` 的 send connector。  
+**可重入：** 插件 connect 未完成时返回 `ncclInProgress`，外层 while 再进来。
+
+**第一次进来（还没有 map）：**
+
+1. 读对端 `useGdr`；对端没有 GDR → **清掉本端 `DIRECT_NIC`**（必须两边都能直 DMA）。  
+2. `calloc connectMap` 挂在 `send->transportResources`（主线程这份是「地图副本」）。  
+3. `populateCommNetAttrs`：按集体/网络 P2P 填并发 hint。  
+4. 把对端 **handle** + netAttr 打成 `netSendConnectArgs`。  
+5. **`ncclProxyCallAsync(Connect)`**（注意是 Async，不是 Blocking）。  
+6. `PollProxyResponse` 把 proxy 填好的 map 拷回来。
+
+**再进来（map 已有）：** 只 Poll，不再发 RPC。
+
+**Poll 成功之后（主线程把地图变成 GPU 能用的指针）：**
+
+- 同进程、不同 GPU、老 IPC：可能 `cudaDeviceEnablePeerAccess`。  
+- 跨进程（PXN）：`netMapShm` 导入 HOST；DEVMEM / 共享池 `ncclP2pImportShareableBuffer`。  
+- 从 map **解出 GPU 指针**，填：
+
+| `send->conn` | 指向 |
+|--------------|------|
+| `head` | sendMem->head 或 GDRCopy 映射 |
+| `tail` | recvMem->tail |
+| `connFifo` | recvMem->connFifo |
+| `buffs[p]` | 各协议货位 |
+| `stepSize` | SIMPLE 缓冲 / 8 |
+
+- shared 则 `connFifo.mode = OFFSET`。  
+- 挂 `proxyProgress = sendProxyProgress`（设备网且不需 proxy 时为 NULL）。
+
+外层成功则 `cudaMemcpyAsync` 整份 `conn` 到 device。
+
+---
+
+### 4.7 `recvConnect` 逐步流程
+
+与 send 对称：
+
+1. 读对端 send 的 useGdr，必要时清 DIRECT_NIC。  
+2. 第一次：Async Connect，载荷是 **对端 proxyRank** + netAttr（不是 handle；本端已经 listen 过了）。  
+3. Poll 拿 map。  
+4. Recv **禁止 remote proxy**（map.sameProcess 必须为真，在 ProxyConnect 里就会查）。  
+5. 填 `recv->conn`：`head` 来自 sendMem，`tail` 可能是 gdcSync。  
+6. 挂 `recvProxyProgress`。
+
+---
+
+### 4.8 `sendProxyConnect` / `recvProxyConnect`
+
+**线程：proxy。** 这才是「连上网卡 + 准备货位」。
+
+**`sendProxyConnect`**
+
+1. `setNetAttrs`。  
+2. `ncclNetGetDeviceHandle`（多数情况不用）。  
+3. **`ncclNet->connect(netDev, 对端 handle, &netSendComm)`**  
+   - shared + `NET_SHARED_COMMS` + `maxRecvs>1`：按 netDev×远端 rank **复用** 一个 sendComm。  
+   - `netSendComm==NULL` → `*done=0`，主线程下次再 Poll（异步 connect）。  
+4. `*done=1` 后分配 **connectMap**：  
+   - 非 shared：每协议一块专用缓冲（GDR 则放 GPU）。  
+   - shared：挂上共享池。  
+   - 永远有 sendMem/recvMem（HOST；跨进程则 `netCreateShm`）。  
+   - 可选 GDRCopy `gdcSync`。  
+5. `head = shared ? -NCCL_STEPS : 0`；`connFifo[].size = -1`。  
+6. 对各协议缓冲 `regMr` 或 `regMrDmaBuf`。  
+7. 整份 map **拷回**主线程。
+
+**`recvProxyConnect`**
+
+1. 记下对端 `proxyRank`。  
+2. **`ncclNet->accept(netListenComm, &netRecvComm)`**（也可复用 recvComm）。  
+3. 未完成 → InProgress。  
+4. **立刻 `closeListen`**（这条 listen 已用完）。  
+5. `sameProcess==0` → 内部错误（recv 无 PXN）。  
+6. 分配货位 + host 控制面 + 可选 `gdcSync/gdcFlush`。  
+7. `regMr`，返回 map。
+
+Connect 成功后 connection 标 **`connConnected`**。此后稳态只走 Progress。
+
+### 4.9 建连结束时你手里有什么
+
+```text
+主线程 / GPU:
+  connector.conn = { buffs, head, tail, connFifo, flags }
+  proxyConn.proxyProgress = send/recvProxyProgress
+
+Proxy:
+  send/recvNetResources = { netSend/RecvComm, map, mhandles, step, ... }
+
+对端对称的一套
+```
+
+**④ 再一条 bootstrap 栅栏**，清 `connectSend/Recv` mask，防止有人已经开始拆连接、别人还在 import 缓冲。
 
 ---
 
