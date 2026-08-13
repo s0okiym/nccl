@@ -60,17 +60,74 @@ NCCL 做成：**主线程是 client，proxy 是 server，中间是 Unix/TCP sock
 
 ---
 
-## 3. 谁在什么时候调用 `sendSetup`？
+## 3. 谁在什么时候调用 `sendSetup` / `recvSetup`？
 
-初始化建跨节点发送边时：
+### 3.1 是不是「主线程 bootstrap 阶段」？
+
+**不完全是。** 拆开说：
+
+| 说法 | 对不对 |
+|------|--------|
+| **主线程**调用（init / 第一次建边的那个线程） | **对**；不是 proxy 进度线程 |
+| 属于最早的 **`bootstrapInit` 握手**（uniqueId / 根进程） | **不对** |
+| 发生在 bootstrap **已经建好之后** | **对** |
+| **借用 bootstrap** 把 Setup 产出的 `connectInfo` 发给对端 rank | **对** |
+| **只**在 comm 初始化时调用一次 | **不对**；运行时第一次 P2P 建边还会再走 |
+
+更准确的名字是：**传输建连（transport setup）**，不是 bootstrap 协议本身。
 
 ```text
-initTransportsRank / p2p 预连接
-  → ncclTransportP2pSetup(comm, graph, connIndex)
+ncclCommInitRank
+  ├─ ① bootstrapInit              ← 真正的 “bootstrap 阶段”
+  │     带外 TCP、交换 uniqueId / 地址
+  │
+  ├─ ② initTransportsRank
+  │     AllGather 拓扑、算 ring/tree
+  │     起 proxy 线程
+  │
+  └─ ③ 建 Ring/Tree/NVLS/P2P 边
+        ncclTransportP2pSetup(comm, graph, connIndex)
+          selectTransport
+            → sendSetup / recvSetup     ← 这里（主线程）
+          bootstrapSend / Recv          ← 用 ① 的通道交换 connectInfo
+          sendConnect / recvConnect
+```
+
+`ncclTransportP2pSetup`（`src/transport.cc`）里顺序就是：先 `selectTransport` → `setup`，再 `bootstrapSend`/`bootstrapRecv` 交换 `ncclConnect`。
+
+### 3.2 两种「带外通道」不要混
+
+`sendSetup`/`recvSetup` 里会碰到 **两条完全不同的带外路径**：
+
+| 通道 | 谁跟谁 | 干什么 |
+|------|--------|--------|
+| **Proxy RPC**（Init / Setup / Connect） | 本 rank **主线程** ↔ **本机（或 PXN）proxy** | 在 proxy 上建 `sendNetResources` / listen |
+| **Bootstrap** | 本 rank ↔ **对端 rank** | 交换 handle、proxyRank、useGdr |
+
+RPC Setup **不是** bootstrap；它发生在 bootstrap 已经可用之后，并且 Setup 返回后才用 bootstrap 把结果送给对端。
+
+### 3.3 调用栈（集体拓扑边，init 时）
+
+```text
+initTransportsRank
+  → ncclTransportRingConnect / TreeConnect / …
+  → ncclTransportP2pSetup(comm, &graphs[RING|TREE|…], connIndex=0)
   → selectTransport(..., graph, channel, peer, connIndex)
   → 选中 NET 后
-  → netTransport.send.setup == sendSetup(...)
+  → netTransport.send.setup  == sendSetup(...)
+  → netTransport.recv.setup  == recvSetup(...)
 ```
+
+### 3.4 不只在 comm init：运行时还会再调
+
+| 时机 | 典型调用 | graph |
+|------|----------|--------|
+| init 里集体边 | `ncclTransportP2pSetup(comm, &graphs[RING/TREE], 0)` | **非 NULL**（topo 算法图） |
+| init 里 NVB 预连接 | `ncclTransportP2pSetup(comm, NULL, 1)`（`init.cc`） | NULL |
+| 运行时第一次 send/recv（runtime connect） | `group.cc` / enqueue `ncclTransportP2pSetup(comm, NULL, 1)` | NULL |
+| CollNet / NVLS tree 建边 | 同样 `P2pSetup` + 对应 graph | 非 NULL |
+
+`graph==NULL` 的那些是 **网络 send/recv 点对点边**，不是集体 topo 边。
 
 参数含义：
 
@@ -277,11 +334,14 @@ Setup 结束时：proxy 上有一个 **已填属性、尚未 connect 的发送�
      │ sendSetup 返回                                │
      │                                              │
      ▼                                              ▼
-  之后 bootstrap 和对端交换 connectInfo
+  sendSetup 返回后（仍在 ncclTransportP2pSetup 里）
+  主线程 bootstrapSend/Recv：和对端交换 connectInfo
   再 sendConnect → RPC Connect → 真正 ncclNet->connect
 ```
 
 对端 **recvSetup** 是对称的另一条 RPC Setup，但 **recvProxySetup 会 listen**，响应里带 `ncclNetHandle_t`。发送侧 Setup **没有** handle。
+
+注意：图里的 bootstrap 交换发生在 **Setup 返回之后**，且 bootstrap 通道在更早的 `bootstrapInit` 里已经建好。
 
 ---
 
@@ -292,7 +352,7 @@ Setup 结束时：proxy 上有一个 **已填属性、尚未 connect 的发送�
 | Init | `ncclProxyConnect` | 登记 connection | 无 |
 | **Setup（本文）** | `sendSetup` → CallBlocking(Setup) | `sendProxySetup` | **仅 getProperties** |
 | （对端）Setup | `recvSetup` | `recvProxySetup` | **listen** → handle |
-| bootstrap | 交换 handle / proxyRank / useGdr | — | — |
+| **Bootstrap 交换**（对端 rank） | `bootstrapSend/Recv` | — | — |
 | Connect | `sendConnect` → CallAsync(Connect) | `sendProxyConnect` | **connect** + 分配缓冲 + regMr |
 
 所以：**RPC Setup ≠ 连上网卡**；是 **“在正确的 proxy 上创建并配置发送资源”**。
@@ -313,6 +373,9 @@ Setup 结束时：proxy 上有一个 **已填属性、尚未 connect 的发送�
 **Q：失败了怎么办？**  
 `CallBlocking` 返回错误；connection 可能停在未 Setup 完。上层 init 失败，不会进入正常 isend。
 
+**Q：sendSetup/recvSetup 是主线程 bootstrap 阶段调的吗？**  
+主线程 **对**；**bootstrapInit 那个阶段不对**。它们在 bootstrap 已经起来之后的 **`ncclTransportP2pSetup`（传输建连）** 里调用，并用 bootstrap **交换** Setup 的产物。运行时第一次 P2P 建边还会再调。详见 [§3](#3-谁在什么时候调用-sendsetup--recvsetup)。
+
 ---
 
 ## 修订记录
@@ -320,3 +383,4 @@ Setup 结束时：proxy 上有一个 **已填属性、尚未 connect 的发送�
 | 日期 | 内容 |
 |------|------|
 | 2026-07-10 | 初稿：sendSetup 逐步说明；RPC Setup 的 client/server、Init vs Setup vs Connect |
+| 2026-07-10 | §3：澄清主线程 vs bootstrapInit；Proxy RPC vs bootstrap 交换；init 与 runtime 多次调用 |
