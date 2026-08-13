@@ -2,6 +2,7 @@
 
 > **面向读者**：不熟悉 NCCL 内部的读者；先建立直觉，再对照代码。  
 > **对应源码**：`src/transport/net.cc`  
+> **生命周期与函数时序（推荐）**：[`nccl_transport_net_cc_lifecycle.md`](nccl_transport_net_cc_lifecycle.md)  
 > **进阶文档**：[`net-cc-analysis.md`](net-cc-analysis.md)（偏源码结构）  
 > **相关**：`proxy-internals.md`、`ib-isend-analysis.md`
 

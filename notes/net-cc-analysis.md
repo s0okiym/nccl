@@ -4,6 +4,7 @@
 > **角色**：NET 传输层宿主实现——把 **GPU kernel ↔ Proxy ↔ `ncclNet` 插件（IB/Socket 等）** 粘合起来  
 > **版本语境**：NCCL 2.30.x  
 > **小白入门（shared/设计动机）**：[`net-cc-beginner-guide.md`](net-cc-beginner-guide.md)  
+> **生命周期与函数时序**：[`nccl_transport_net_cc_lifecycle.md`](nccl_transport_net_cc_lifecycle.md)  
 > **相关笔记**：`proxy-internals.md`、`ib-isend-analysis.md`、`ib-send-recv-cts.md`、`net-ib-code-review.md`、`chunking-pattern-fifo-registration.md`、`thread-model.md`
 
 ---
