@@ -2,7 +2,8 @@
 
 > **代码**：`src/transport/net.cc` `sendSetup` / `sendProxySetup`；`src/proxy.cc` `ncclProxyConnect` / `ncclProxyCallBlocking` / `proxyProgressAsync`  
 > **读者**：想搞清 “RPC Setup 到底是什么”  
-> **相关**：[`nccl_transport_net_cc_beginner_guide.md`](./nccl_transport_net_cc_beginner_guide.md)、[`nccl_transport_net_cc_functions.md`](./nccl_transport_net_cc_functions.md)、[`nccl_proxy_internals.md`](./nccl_proxy_internals.md)
+> **相关**：[`nccl_transport_net_cc_beginner_guide.md`](./nccl_transport_net_cc_beginner_guide.md)、[`nccl_transport_net_cc_functions.md`](./nccl_transport_net_cc_functions.md)、[`nccl_proxy_internals.md`](./nccl_proxy_internals.md)  
+> **主线程全函数时序**：见 [§10](#10-主线程视角netcc-各函数何时被调用各完成什么)
 
 ---
 
@@ -378,9 +379,144 @@ Setup 结束时：proxy 上有一个 **已填属性、尚未 connect 的发送�
 
 ---
 
+## 10. 主线程视角：`net.cc` 各函数何时被调用、各完成什么
+
+下面只谈 **主线程**（`ncclCommInit*` / 第一次 enqueue 建边 / Register / Destroy 那个线程）。  
+`sendProxy*` / `recvProxy*` / `*Progress` 跑在 **proxy 线程**，由 RPC 或进度循环触发，见文末对照表。
+
+### 10.1 总时间线（从 init 到销毁）
+
+```text
+主线程
+│
+│  A. bootstrapInit                    尚不进入 net.cc
+│  B. initTransportsRank
+│       拓扑、AllGather、起 proxy
+│  C. 集体建边（Ring/Tree/NVLS…）
+│       ncclTransportP2pConnect 只打 mask
+│       ncclTransportP2pSetup(graph, connIndex=0)
+│         ┌─ canConnect
+│         ├─ sendSetup / recvSetup          ← RPC Setup
+│         ├─ bootstrap 交换 connectInfo
+│         └─ sendConnect / recvConnect      ← RPC Connect（可多次 poll）
+│              └ populateCommNetAttrs
+│              └ netMapShm（PXN/跨进程时）
+│  D. （可选）NVB 预连接
+│       ncclTransportP2pSetup(NULL, 1)     再走一遍 C，graph=NULL
+│  E. 运行时第一次 ncclSend/Recv（runtime connect）
+│       再 ncclTransportP2pSetup(NULL, 1)
+│  F. 可选 ncclCommRegister / Graph 捕获
+│       ncclNetLocalRegisterBuffer / GraphRegisterBuffer
+│         └ netRegisterBuffer              ← RPC Register
+│       结束：cleanupNet / ncclNetDeregBuffer
+│  G. ncclCommAbort / Destroy
+│       sendFree / recvFree
+│
+proxy 线程（被上面 RPC 叫醒，或进度循环）
+    send/recvProxySetup | Connect | Progress | Free | Reg/Dereg
+```
+
+### 10.2 阶段 C 展开：`ncclTransportP2pSetup` 里的主线程顺序
+
+源码：`src/transport.cc`。对每个要对齐的 peer、每个 channel：
+
+**① 只对「mask 置位」的边做 setup（选传输）**
+
+```text
+selectTransport<recv 或 send>
+  for t in {P2P, SHM, NET, COLLNET}:   // 数组顺序，谁 canConnect 成功用谁
+    canConnect(...)                    // net.cc：同机则问拓扑是否允许 NET
+    if ok:
+      sendSetup 或 recvSetup           // net.cc
+```
+
+同机常先被 P2P/SHM 抢走，**走不到** `sendSetup`。跨节点 NET 才会进来。
+
+**② Setup 全部做完后，bootstrap 交换 `ncclConnect` 数组**
+
+主线程此时 **不进** net.cc，只用 bootstrap 把 ① 写出的 `connectInfo` 和对方对调。  
+发送侧 Setup 贡献 proxyRank+useGdr；接收侧 Setup 贡献 listen handle。
+
+**③ 对尚未 `connected` 的 connector 调 connect**
+
+```text
+conn->transportComm->connect(...)
+  == sendConnect 或 recvConnect         // net.cc，可返回 ncclInProgress
+成功则 cudaMemcpyAsync conn → device
+循环直到全部 Success（异步 connect 会多转几圈）
+```
+
+`sendConnect` / `recvConnect` 内部（主线程）：
+
+| 顺序 | 调用 | 完成的功能 |
+|------|------|------------|
+| 1 | 读对端 useGdr，必要时清 `DIRECT_NIC` | 两端 GDR 协商 |
+| 2 | `populateCommNetAttrs` | 填插件并发 hint |
+| 3 | `ncclProxyCallAsync(Connect)` | 让 proxy 去 accept/connect、分配缓冲、regMr |
+| 4 | `ncclPollProxyResponse` | 取回 `connectMap` |
+| 5 | 必要时 `netMapShm` / import IPC | 让 GPU 看见 proxy 分配的内存 |
+| 6 | 填 `conn.head/tail/buffs/connFifo` | kernel 以后只认这份 conn |
+| 7 | 挂 `proxyProgress` | 运行时由 proxy 调 progress |
+
+**④ 再建一条 bootstrap 栅栏**，清 `connectSend/Recv` mask。  
+然后把 `ncclConnInfo` 拷到 device，kernel 才能用。
+
+### 10.3 按「主线程会直接进到的函数」逐个说明
+
+| 时机 | 主线程进入的 `net.cc` 函数 | 完整功能（主线程侧） |
+|------|---------------------------|----------------------|
+| P2pSetup 选传输 | **`canConnect`** | 这对 peer 能否用 NET；同机再问拓扑 |
+| 选中 NET 后立刻 | **`sendSetup`** | 定 shared/网卡/PXN/GDR；`ProxyConnect`+**RPC Setup**；写 connectInfo |
+| 同上 | **`recvSetup`** | 本 rank 网卡 listen（经 RPC）；connectInfo 带 handle+useGdr |
+| send/recvConnect 里 | **`populateCommNetAttrs`** | 按集体/网络 P2P 填 `ncclNetAttr_t` |
+| sendConnect 跨进程 | **`netMapShm`** | 导入 proxy 建的 HOST 映射（PXN） |
+| bootstrap 交换之后 | **`sendConnect`** | **RPC Connect**；import map；填 GPU send conn |
+| 同上 | **`recvConnect`** | **RPC Connect**；填 GPU recv conn |
+| 用户 `ncclCommRegister` | **`ncclNetLocalRegisterBuffer`** | 查 reg 记录 → `netRegisterBuffer` |
+| Graph 捕获注册 | **`ncclNetGraphRegisterBuffer`** | Graph 注册 + `netRegisterBuffer` + cleanup 入队 |
+| 上面两者内部 | **`netRegisterBuffer`** | 对每个 NET peer **RPC Register**；复用或新建 mhandle |
+| Graph 回调 / 显式注销 | **`cleanupNet`** / **`ncclNetDeregBuffer`** | Graph dereg 或 **RPC Deregister** |
+| comm 销毁 | **`sendFree`** | 关主线程侧 send map / IPC / SHM attach |
+| comm 销毁 | **`recvFree`** | free 主线程 recv map |
+
+**主线程不会直接调用、只被 RPC/进度间接执行的函数：**
+
+| 函数 | 何时被间接触发 |
+|------|----------------|
+| `sendProxySetup` / `recvProxySetup` | Setup RPC |
+| `sendProxyConnect` / `recvProxyConnect` | Connect RPC |
+| `proxySharedInit` | init 里 `ProxyMsgSharedInit`（`init.cc`，不是 sendSetup） |
+| `sharedNetBuffersInit/Get/Destroy` | Connect / Progress / Free（proxy） |
+| `sendProxyProgress` / `recvProxyProgress` | **第一次真正通信之后**，proxy 进度循环 |
+| `send/recvProxyReg/DeregBuffer` | Register RPC |
+| `sendProxyFree` / `recvProxyFree` | comm 销毁时 proxy 侧 |
+| `setNetAttrs` / `setXferNetAttrs` / `printNetAttrs` | Connect/Progress 在 **proxy** |
+| `ncclNetGetDeviceHandle` / `getHandleForAddressRangeFlags` | Proxy Connect/Reg |
+| `netCreateShm` / `netDumpMap` / `netHandleCmp` | Proxy 或调试 |
+
+### 10.4 和「通信进行时」的分界
+
+```text
+主线程建连做完
+  → GPU kernel 只碰 conn.*
+  → 主线程 enqueue 后通常不再进 sendSetup
+  → 数据面在 proxy：send/recvProxyProgress
+
+例外：runtime connect、Register、Destroy 会再次进入上表主线程函数
+```
+
+### 10.5 一次集体 AllReduce（边已在 init 建好）主线程还碰不碰 net.cc？
+
+**一般不碰。** 主线程只 enqueue + launch kernel。  
+NET 数据面全在 **proxy progress**。  
+除非这次操作触发了 **尚未 connect 的 P2P 边** 或 **用户缓冲注册**。
+
+---
+
 ## 修订记录
 
 | 日期 | 内容 |
 |------|------|
 | 2026-07-10 | 初稿：sendSetup 逐步说明；RPC Setup 的 client/server、Init vs Setup vs Connect |
 | 2026-07-10 | §3：澄清主线程 vs bootstrapInit；Proxy RPC vs bootstrap 交换；init 与 runtime 多次调用 |
+| 2026-07-10 | §10：主线程调用顺序；P2pSetup 内 canConnect→Setup→bootstrap→Connect；各函数职责与 proxy 对照 |
