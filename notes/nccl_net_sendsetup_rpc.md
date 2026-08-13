@@ -511,6 +511,30 @@ conn->transportComm->connect(...)
 NET 数据面全在 **proxy progress**。  
 除非这次操作触发了 **尚未 connect 的 P2P 边** 或 **用户缓冲注册**。
 
+### 10.6 稳态：是不是只剩 Progress 在转？
+
+**大体对。** 边已连上、缓冲已注册之后，**热路径就是 proxy 反复调 `sendProxyProgress` / `recvProxyProgress`**（内部再调插件 `isend`/`irecv`/`test`）。  
+主线程不再进 `sendSetup` / `sendConnect`。
+
+稳态时每一刀集体/sendrecv：
+
+| 谁 | 在干什么 |
+|----|----------|
+| **GPU kernel** | 写/读 `conn.buffs`，改 tail / `connFifo.size`（**不在** `net.cc`） |
+| **Proxy 进度线程** | **`sendProxyProgress` / `recvProxyProgress`** |
+| Progress **内部**还会调 | `sharedBuffersGet`（shared 池）、偶发 `setXferNetAttrs`、profiler |
+
+**不是「永远只有这两个函数」：**
+
+| 情况 | 还会进哪些 `net.cc` |
+|------|---------------------|
+| **第一次** 对某个 peer 做 send/recv（runtime connect） | 再走 `P2pSetup` → Setup/Connect |
+| 训练中 **`ncclCommRegister` / Graph 捕获** | `ncclNetLocal/GraphRegisterBuffer`、RPC Reg |
+| **Device net**（unpack 且 `needsProxyProgress==0`） | `proxyProgress` 可为 **NULL**，稳态甚至不调这两个函数 |
+| Abort / Destroy | `sendFree` / `recvFree` + proxy Free |
+
+**一句话：** Setup/Connect/Reg/Free 是建连、注册、收尾；稳态数据面 = **kernel + 两个 Progress**（及插件收发）。
+
 ---
 
 ## 修订记录
@@ -520,3 +544,4 @@ NET 数据面全在 **proxy progress**。
 | 2026-07-10 | 初稿：sendSetup 逐步说明；RPC Setup 的 client/server、Init vs Setup vs Connect |
 | 2026-07-10 | §3：澄清主线程 vs bootstrapInit；Proxy RPC vs bootstrap 交换；init 与 runtime 多次调用 |
 | 2026-07-10 | §10：主线程调用顺序；P2pSetup 内 canConnect→Setup→bootstrap→Connect；各函数职责与 proxy 对照 |
+| 2026-07-10 | §10.6：稳态热路径仅为 Progress；runtime connect / Register / device-net / Destroy 例外 |
