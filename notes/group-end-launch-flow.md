@@ -1,10 +1,17 @@
 # NCCL Group-End → Kernel Launch 流程深度解析（以 AllReduce 为例）
 
-> 本文基于 NCCL 2.30.7 源码，逐环节拆解「用户调用一个集合通信 API」到「GPU 内核真正完成这次通信」之间，
+> 本文基于 **NCCL 2.30.7** 源码（写作时的仓库状态），逐环节拆解「用户调用一个集合通信 API」到「GPU 内核真正完成这次通信」之间，
 > 主机端（Host）、设备端（Device）、代理线程（Proxy）三层各自做了什么、通过什么数据结构握手。
 > 全程以一次 **AllReduce** 作为贯穿例子。所有结论均带 `文件:行号`，可直接跳转核对。
 >
 > 阅读前置：建议先看 `docs/dev_guide/nccl_internals.md`。本文聚焦「group end 到 launch」这一段的细枝末节。
+>
+> ⚠️ **时效说明（2026-08-14）**：仓库其后已升级到 **NCCL 2.31.2**（上游 "Enqueue Overhaul" 合并）：
+> `src/enqueue.cc` 移至 **`src/enqueue/enqueue.cc`**（并新增 `src/enqueue/{task_prep,task_sched}/`、`mgmt_task_enq.cc`）；
+> `groupLaunch` 拆出 `groupLaunchLegacy`（`group.cc:748`）/ `groupLaunchEnqueueRearch`（`group.cc:912`）两个变体，
+> 由 `groupLaunch`（`group.cc:1018`）分派。本文行号对应 2.30.7，按新树阅读时需换算路径并偏移行号
+> （例：`ncclEnqueueCheck` 3124→3383、`ncclLaunchPrepare` 1568→1661、`ncclLaunchKernel` 1753→1852、
+> `ncclGroupEndInternal` 766→1026；proxy.cc 基本未动）。流程主体（task→plan→work/proxyOp 四层抽象）仍一致。
 
 ---
 
@@ -699,4 +706,5 @@ proxy 的网络收发也以同样的 step 序列推进。所以各 rank 只要�
 
 ---
 
-*本文为 fork-local 分析笔记，非 NVIDIA 官方文档。结论以 NCCL 2.30.7 源码为准。*
+*本文为 fork-local 分析笔记，非 NVIDIA 官方文档。结论以 NCCL 2.30.7 源码为准（当前仓库已升级至 2.31.2，
+路径/行号偏移见文首时效说明）。*
