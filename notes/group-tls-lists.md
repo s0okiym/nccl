@@ -300,3 +300,65 @@ GroupEnd 之后：
 5. **隐式 group 同样走这三张表。** 单次 `ncclAllReduce` 也会 Join Head、可能 Preconnect、GroupEnd 立刻 launch。
 
 一句话：`Head` 登记「谁要干活、按 clique 怎么排」，`PreconnectHead` 登记「谁要先接线」，`AsyncJobs` 登记「GroupEnd 时要跑哪些函数」；最外层 `GroupEnd` 按 **异步 job（含 P2P connect）→ 对称注册 → collective 准备/连接 → `doLaunches`** 把它们吃掉。
+
+---
+
+## 7. Intrusive 链表：next 长在对象里，不是 `void*` 容器
+
+`ncclIntruQueue<T, &T::next>`（`utils.h:369`）是 **侵入式** 单链表：`next` 是 `T` 自己的字段，队列只有 `head/tail/nElems`。Enqueue 改两个指针，不另 `new` 包装结点。
+
+这和 C 里常见的「容器塞 `void*`」相反：
+
+```text
+非侵入: Queue → [Node|void*] → [Node|void*]  再 chase 到 Job（常要为 Node 再分配）
+侵入:   Queue.head ──────────► Job { next ──► Job }
+```
+
+热路径要零分配、dequeue 直接得到 `T*`、同一 comm 用不同字段同时挂多条链（`groupNext[4]`、`preconnectNext`）。代价：每个 next 字段同时只能在一条链上；「不在链上」不能用 `nullptr`（链尾已经是），所以用 `0x1`。
+
+---
+
+## 8. Group TLS 在哪条线程
+
+**调用 NCCL API 的那条用户线程** 的 C++ `thread_local`，NCCL 不为它 `pthread_create` / `malloc`。多数程序里就是 main / MPI rank 主循环；多 pthread 分别调 NCCL 则各有一份互不可见的表。
+
+`GroupStart` 与配对的 `GroupEnd` 必须在同一线程。最外层 End 把表 `memcpy`/`transfer` 进堆上的 `ncclGroupJob` 后立刻 `groupLocalResetJobState()`。之后 blocking 仍在调用线程跑 `groupLaunch(groupJob)`；nonblocking 才另开线程，新线程有自己的空 TLS，吃的是 `groupJob` 拷贝。Proxy / Bootstrap / RAS 不填这三张表。
+
+---
+
+## 9. Clique：同进程、同世界的一组 `ncclComm`
+
+此处 **不是** 图论完全子图，也不是 NVLink/MNNVL 拓扑 clique。
+
+`doLaunches`（`group.cc:432-435`）：clique = `groupNext` 上 **`intraComm0` 相同** 的连续一段。`intraComm0` 是本进程里该世界 communicator 的 leader（`hostHash+pidHash` 相同、global rank 最小的那个 `ncclComm*`，`init.cc:1160-1212`）。
+
+```text
+2 进程 × 4 GPU：P0 rank 0–3 → clique A（leader=comm0）；P1 rank 4–7 → clique B
+```
+
+用途：`NCCL_LAUNCH_MODE=GROUP` 时在 `intraComm0` 上做进程内 barrier，各卡同一 round 发一个 plan；同一 clique 不能混 CUDA Graph capture；split 共享连接时 preconnect 按 clique 切开。`Join` 故意把同 `intraComm0` 的 comm 插在一起。`intraNext` 是 clique 的永久成员链；`groupNext` 只是这一次 group 的待办链。
+
+---
+
+## 10. `PreconnectHead` 只因 P2P 接线，comm 上仍可有 collective
+
+全库只有 `p2pTaskAppend` 调用 `ncclGroupCommPreconnect`（`enqueue.cc:2664,2672`）：某 `Send`/`Recv` 发现该 peer 的 P2P connector 尚未建立。
+
+Collective 通道连接走 GroupEnd 的 `ncclCollPreconnect`（`group.cc:226,811-828`），**不登记** 到 `PreconnectHead`。
+
+`p2pTaskAppend` 先 `Join(..., Collective)`，所以在 `PreconnectHead` ⇒ 一定也在 `Head[Collective]`。反过来不成立（纯 AllReduce，或 P2P 早已连好）。同一 comm、同一次 group 可以既有 AllReduce 又有 Send：planner 里两种 task 都有；End 先按 `PreconnectHead` 跑 P2P connect，再扫 `Head[Collective]` prepare/launch。
+
+---
+
+## 11. `ncclMgmtTaskEnqueue`：默认关着的管理任务入队口
+
+2.31.2 enqueue 重构路径（`src/enqueue/mgmt_task_enq.cc`）。`NCCL_ENQUEUE_REARCH_ENABLE` 默认 **0**（`enqueue.cc:33`），所以按 2.30 习惯读 `init.cc` 的 `else` 只会看到 `ncclAsyncLaunch`。
+
+打开后：管理类 job（init/destroy/finalize/split、对称窗注册、CE init、mem suspend）不进 TLS `ncclAsyncJobs`，而是 `Join Head[MgmtTask]` + 入 `comm->mgmtTaskQueue`。`groupLaunch` 走 `groupLaunchEnqueueRearch`（`group.cc:1018`）：先按 clique 跑 `ncclMgmtTaskJobFunc` 消化各 comm 的管理队列，再 `Head[RawTask]` prepare，再 `doLaunches`。
+
+| | `ncclAsyncLaunch`（默认） | `ncclMgmtTaskEnqueue`（rearch=1） |
+|---|---|---|
+| 队列 | TLS `ncclAsyncJobs` | `comm->mgmtTaskQueue` |
+| GroupEnd | `groupLaunchLegacy` 开头一锅端 | 固定阶段 ① Mgmt ② Raw prepare ③ launch |
+
+数据面 collective 不走 MgmtTask。Destroy 时 `ncclMgmtTaskJobFunc` 只 dequeue **一个** 任务（`group.cc:312-315`）。
