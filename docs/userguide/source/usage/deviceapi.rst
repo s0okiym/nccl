@@ -18,6 +18,8 @@ Device API consists of the following modules:
  * **Multimem** -- for communication between devices using the hardware multicast feature provided by
    NVLink SHARP (available on some datacenter GPUs since the Hopper generation).
  * **GIN (GPU-Initiated Networking)** -- for communication over the network (since NCCL 2.28.7).
+ * **CFT (Compute Fabric Transport)** -- for communication through CUDA fabric logical endpoints
+   (since NCCL 2.31). See :ref:`usage_cft`.
  * **Reduce, Broadcast, and Fused Building Blocks** — Building Blocks for Computation-Fused Kernels: reduce, copy
    (broadcast), and reduce-then-copy (see :ref:`device_api_reducecopy` in the API reference).
 
@@ -26,17 +28,29 @@ Requirements
 
 The device API relies on symmetric memory (see :ref:`window_reg`), which in turn depends on GPU virtual memory
 management (see :ref:`env_NCCL_CUMEM_ENABLE`) and optionally -- for multimem support -- on NVLink SHARP (see
-:ref:`env_NCCL_NVLS_ENABLE`).
+:ref:`env_NCCL_NVLS_ENABLE`). GIN supports muiltiple networking backends, each with their own set of requirements.
 
 GIN has the following requirements:
 
 * CUDA 12.2 or later when compiling the GPU code
 * NVIDIA GPUs: Volta or newer. NVIDIA GPU drivers >= 510.40.3
-* NVIDIA NICs: CX4 or newer. rdma-core >= 44.0
-* GPU Direct RDMA: GIN host proxy requires DMA-BUF or nvidia-peermem support. GIN GDAKI requires DMA-BUF with kernel version >= 6.1 or nvidia-peermem support
-* Network topology: Requires full NIC connectivity. Does not support topologies where NICs cannot communicate across rails. Also does not support ``NCCL_CROSS_NIC=0``.
-* Fused NICs are not supported. To use GIN on dual-port NICs, set ``NCCL_IB_MERGE_NICS=0``
 * Using GIN for buffers that are backed by multiple cuMem segments requires DMA-BUF
+
+The GIN **CPU Proxy** backend has the following requirements:
+
+* NVIDIA NICs: CX4 or newer
+* GPUDirect RDMA with the internal plugin:
+  * If using DMA-BUF, rdma-core >= 34.0.
+  * If using nvidia-peermem, Mellanox OFED >= 5.0 or DOCA.
+
+The GIN **GDAKI** backend has the following requirements:
+
+* NVIDIA NICs: CX4 or newer. rdma-core >= 44.0
+* GPU Direct RDMA:
+  * If using DMA-BUF, linux kernel >= 6.1.
+  * If using nvidia-peermem on baremetal, linux kernel >= 5.12 and either Mellanox OFED or DOCA driver.
+  * If using nvidia-peermem on virtualized environments, linux kernel >= 6.1 and either Mellanox OFED or DOCA driver.
+  * Mellanox OFED and DOCA driver packages may replace some parts of the upstream drivers. If you plan to install any of those packages, you need Mellanox OFED >= 5.8 or DOCA >= 3.1.0.
 
 When using host-backed buffers, the following additional limitations apply:
 
@@ -48,6 +62,13 @@ When using host-backed buffers, the following additional limitations apply:
 Using the host RMA API requires CUDA 12.5 or greater.
 
 Building with EMIT_LLVM_IR=1 (to generate readable LLVM intermediate representation code) requires CUDA 12.
+
+CFT has the following requirements:
+
+* CUDA 13.3 or later when compiling the GPU code.
+* NVIDIA GPUs: Blackwell or newer. NVIDIA GPU drivers >= 610.43.02
+
+See :ref:`usage_cft` and :ref:`device_api_cft` for CFT setup and API details.
 
 Cross-Version Compatibility
 ----------------------------
@@ -201,12 +222,34 @@ implemented using PTX, e.g., ``multimem.ld_reduce.global.add`` and ``multimem.st
 Thread Groups
 -------------
 
-Many functions in the device API take a thread cooperative group as input to indicate which threads within the CTA will
-take part in the operation. NCCL provides three predefined ones: ``ncclCoopThread()``, ``ncclCoopWarp()``, and (the most
-commonly used) ``ncclCoopCta()``.
+Many functions in the device API take a thread cooperative group (*coop*) as input to indicate which threads within the CTA
+take part in the operation. NCCL's coop types follow the same interface as
+`CUDA Cooperative Groups <https://docs.nvidia.com/cuda/cuda-c-programming-guide/index.html#cooperative-groups>`_ --
+``thread_rank()``, ``size()``, and ``sync()`` -- so a CUDA cooperative group, or any user-defined class providing that
+interface, can be passed wherever a coop is expected. NCCL additionally provides three predefined ones:
+``ncclCoopThread()``, ``ncclCoopWarp()``, and (the most commonly used) ``ncclCoopCta()``.
 
-Users may also pass CUDA cooperative groups, or any class which provides ``thread_rank()``, ``size()``, and ``sync()``
-methods.
+**Non-collective calls.** Not every function that takes a *coop* uses all of its threads to perform the operation.
+For functions such as :cpp:func:`ncclGin::put`, :cpp:func:`ncclGin::signal`, and :cpp:func:`ncclGin::waitSignal`,
+every thread that is a member of the coop must call the function together, passing the same arguments, but only a
+single thread of the coop actually performs the operation; the other member threads simply block on
+entry and exit via ``coop.sync()``, so that the whole coop observes a consistent state before and after the call.
+This means passing a larger coop (e.g. ``ncclCoopCta()`` instead of a single thread) does **not** parallelize the
+operation itself (e.g. it will not speed up a single ``put``'s data transfer) -- its purpose is to let a warp or CTA
+synchronize around a single logical operation. ``ncclGin::put`` and similar functions (e.g. ``get``, ``putValue``,
+``signal``) default their *coop* argument to ``ncclCoopThread()``, whereas ``waitSignal`` and ``waitCounter`` take
+*coop* as a required argument instead (no default).
+
+A few functions use the coop for a different purpose: for example, :cpp:func:`ncclGin::flush` performs an acquire
+that, by default, waits for any ``put`` that is executed-before it from the calling thread's perspective (``put``
+itself performs a release). What changes with the coop argument is not which puts *can* be drained, but which
+threads establish that executed-before relationship: calling ``flush`` with a CTA-wide coop (e.g. ``ncclCoopCta()``)
+has every thread of the CTA join a ``coop.sync()`` before the drain, so puts issued by any thread of the CTA --
+including ones issued individually with ``ncclCoopThread()`` -- are guaranteed executed-before the flush. Calling
+``flush`` with ``ncclCoopThread()`` skips that cross-thread synchronization, so only puts the calling thread already
+knows to be executed-before (its own, or others made visible by some other synchronization) are guaranteed drained.
+
+Check each function's reference entry for its exact behavior.
 
 .. _devapi_teams:
 
@@ -214,12 +257,14 @@ Teams
 -----
 
 To address remote ranks or perform barriers, NCCL refers to subsets of ranks within a communicator as "teams".
-NCCL provides three predefined ones:
+NCCL provides five predefined ones:
 
  * ``ncclTeamWorld()`` -- the "world" team, encompassing all the ranks of a given communicator.
  * ``ncclTeamLsa()`` -- all the peers accessible from the local rank using load/store operations.
  * ``ncclTeamRail()`` -- the set of peers that have the same rank number within their LSA team (a rail team is
    orthogonal to an LSA team).
+ * ``ncclTeamCft()`` -- the CFT team for CUDA fabric logical endpoint unicast operations.
+ * ``ncclTeamCftMultimem()`` -- the CFT team for CUDA fabric logical endpoint multicast operations.
 
 The ``ncclTeam`` structure contains fairly self-explanatory elements ``nRanks``, ``rank``, and ``stride``. The device
 API contains functions to verify team membership, convert rank numbers between teams, etc. The world and LSA teams are
@@ -361,7 +406,7 @@ In :c:type:`ncclDevCommRequirements`, :c:macro:`worldGinBarrierCount` reserves s
 in the launch grid (here ``NCCL_DEVICE_CTA_COUNT``), matching ``gridDim.x``, so each thread block uses
 ``blockIdx.x`` as its barrier index and signal index. GIN relies on these
 barriers and signals for cross-rank synchronization and for tracking asynchronous work. Set ``ginConnectionType`` to
-:c:macro:`NCCL_GIN_CONNECTION_FULL` to connect each rank to all peers (see :c:type:`ncclGinConnectionType_t`).
+:c:enumerator:`NCCL_GIN_CONNECTION_FULL <ncclGinConnectionType_t.NCCL_GIN_CONNECTION_FULL>` to connect each rank to all peers (see :c:enum:`ncclGinConnectionType_t`).
 :c:func:`ncclDevCommCreate` fails if GIN cannot be provided.
 
 On the device, GIN barriers synchronize across ranks over the network. Each thread block uses ``blockIdx.x`` to select its
@@ -414,7 +459,7 @@ the following as needed.
   :cpp:class:`ncclGinBarrierSession` with ``ncclTeamTagWorld()``.
 
 * **Before NCCL 2.29.7 — no** :c:member:`ginConnectionType` — Set :c:member:`ginForceEnable` to ``true`` to enable full GIN
-  connectivity (equivalent to :c:macro:`NCCL_GIN_CONNECTION_FULL` once :c:member:`ginConnectionType` exists). The
+  connectivity (equivalent to :c:enumerator:`NCCL_GIN_CONNECTION_FULL <ncclGinConnectionType_t.NCCL_GIN_CONNECTION_FULL>` once :c:member:`ginConnectionType` exists). The
   :c:member:`ginConnectionType` field is available starting with NCCL 2.29.7 (see :c:type:`ncclDevCommRequirements` in
   :ref:`device_api_setup`).
 
